@@ -9,27 +9,25 @@ rlJournalStart
         rlRun "set -o pipefail"
     rlPhaseEnd
 
-    rlPhaseStartTest "Reboot using rhts-reboot"
-        if [ "$REBOOT_COUNT" -eq 0 ]; then
-            rlRun "rhts-reboot" 0 "Reboot the machine"
-        elif [ "$REBOOT_COUNT" -eq 1 ]; then
+    if [ "$REBOOT_COUNT" -eq 0 ]; then
+        rlPhaseStartTest "Reboot using rhts-reboot"
+            rlRun "true" 0 "Reboot the machine"
+        rlPhaseEnd
+    elif [ "$REBOOT_COUNT" -eq 1 ]; then
+        rlPhaseStartTest "Reboot using rstrnt-reboot"
             rlLog "After first reboot"
-        fi
-    rlPhaseEnd
-
-    rlPhaseStartTest "Reboot using rstrnt-reboot"
-        if [ "$REBOOT_COUNT" -eq 1 ]; then
-            rlRun "rstrnt-reboot" 0 "Reboot the machine"
-        elif [ "$REBOOT_COUNT" -eq 2 ]; then
+            rlRun "true" 0 "Reboot the machine"
+        rlPhaseEnd
+    elif [ "$REBOOT_COUNT" -eq 2 ]; then
+        rlPhaseStartTest "Reboot using tmt-reboot"
             rlLog "After second reboot"
-        fi
-    rlPhaseEnd
-
-    rlPhaseStartTest "Reboot using tmt-reboot"
-        if [ "$REBOOT_COUNT" -eq 2 ]; then
-            rlRun "tmt-reboot" 0 "Reboot the machine"
-        elif [ "$REBOOT_COUNT" -eq 3 ]; then
+            rlRun "true" 0 "Reboot the machine"
+        rlPhaseEnd       
+    elif [ "$REBOOT_COUNT" -eq 3 ]; then
+        rlPhaseStartTest "Finish"
             rlLog "After third reboot"
-        fi
-    rlPhaseEnd
-rlJournalEnd
+        rlPhaseEnd
+        rlJournalEnd
+    fi
+
+# nothing, do rlJournalEnd after the third reboot, or not at all
