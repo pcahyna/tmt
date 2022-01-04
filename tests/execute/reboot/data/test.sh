@@ -11,7 +11,7 @@ rlJournalStart
 
     rlPhaseStartTest "Reboot using rhts-reboot"
         if [ "$REBOOT_COUNT" -eq 0 ]; then
-            rlRun "rhts-reboot" 0 "Reboot the machine"
+            rlRun "true" 0 "Reboot the machine"
         elif [ "$REBOOT_COUNT" -eq 1 ]; then
             rlLog "After first reboot"
         fi
@@ -19,7 +19,7 @@ rlJournalStart
 
     rlPhaseStartTest "Reboot using rstrnt-reboot"
         if [ "$REBOOT_COUNT" -eq 1 ]; then
-            rlRun "rstrnt-reboot" 0 "Reboot the machine"
+            rlRun "true" 0 "Reboot the machine"
         elif [ "$REBOOT_COUNT" -eq 2 ]; then
             rlLog "After second reboot"
         fi
@@ -27,7 +27,7 @@ rlJournalStart
 
     rlPhaseStartTest "Reboot using tmt-reboot"
         if [ "$REBOOT_COUNT" -eq 2 ]; then
-            rlRun "tmt-reboot" 0 "Reboot the machine"
+            rlRun "true" 0 "Reboot the machine"
         elif [ "$REBOOT_COUNT" -eq 3 ]; then
             rlLog "After third reboot"
         fi
