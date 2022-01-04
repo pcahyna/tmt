@@ -4,12 +4,10 @@
 
 REBOOT_COUNT=${REBOOT_COUNT:-0}
 
-rlJournalStart
-    rlPhaseStartSetup
-        rlRun "set -o pipefail"
-    rlPhaseEnd
+set -o pipefail
 
     if [ "$REBOOT_COUNT" -eq 0 ]; then
+        rlJournalStart
         rlPhaseStartTest "Reboot using rhts-reboot"
             rlRun "rhts-reboot" 0 "Reboot the machine"
         rlPhaseEnd
