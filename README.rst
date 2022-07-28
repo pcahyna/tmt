@@ -235,13 +235,18 @@ features right at hand install everything::
 
     sudo dnf install tmt-all
 
-For RHEL 8 and CentOS 8, first make sure that you have available
-the `EPEL <https://fedoraproject.org/wiki/EPEL>`_ repository. You
-might also have to enable additional repositories::
+For CentOS and RHEL, first make sure that you have available the
+`EPEL <https://docs.fedoraproject.org/en-US/epel/>`_ repository.
+You might also have to enable additional repositories::
 
-    sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
     sudo dnf config-manager --enable powertools  # CentOS 8
     sudo dnf config-manager --enable rhel-CRB    # RHEL 8
+    sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+
+    sudo dnf config-manager --enable crb         # CentOS 9
+    sudo dnf config-manager --enable rhel-CRB    # RHEL 9
+    sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+
     sudo dnf install tmt
 
 For plugins which cannot work outside of VPN and so live within
@@ -295,6 +300,16 @@ For Fish, add this to ``~/.config/fish/completions/tmt.fish``::
 Open a new shell to enable completion. Or run the ``eval`` command
 directly in your current shell to enable it temporarily.
 
+This is however run every time you start a shell which can cause
+some delay. To speed it up, write the generated script to a file
+and then source it from your shell's configuration file. All
+of this can be achieved using ``tmt setup completion`` command.
+By default, it outputs the completion script to the terminal but
+it can also add it to your ``~/.bashrc`` or ``~/.zshrc`` using
+the ``--install`` option::
+
+    tmt setup completion {bash, zsh, fish} --install
+
 
 Exit Codes
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -324,6 +339,10 @@ TMT_DEBUG
     levels from 1 to 3. However, some of the plugins go even
     deeper when needed.
 
+TMT_PLUGINS
+    Path to a directory with additional plugins. Multiple paths
+    separated with the ``:`` character can be provided as well.
+
 NO_COLOR
     Disable colors in the terminal output. Output only plain,
     non-colored text. See https://no-color.org/ for more
@@ -337,24 +356,52 @@ TMT_TREE
     is copied. This usually contains the whole git repository from
     which tests have been executed.
 
+TMT_TEST_DATA
+    Path to the directory where test can store logs and other
+    artifacts generated during its execution. These will be pulled
+    back from the guest and available for inspection after the
+    test execution is finished.
+
+TMT_PLAN_DATA
+    Path to the common directory used for storing logs and other
+    artifacts related to the whole plan execution. It is pulled
+    back from the guest and available for inspection after the
+    plan is completed.
+
+TMT_SOURCE_DIR
+    Path to directory with downloaded and extracted sources if
+    the ``dist-git-source`` option was used in the ``discover``
+    step.
+
+TMT_REBOOT_COUNT
+    During the test execution the ``tmt-reboot`` command can be
+    used to request reboot of the guest. This variable contains
+    number of reboots which already happened during the test.
+    Value is set to ``0`` if no reboot occurred.
+
+    In order to keep backward-compatibility with older tests,
+    ``rhts-reboot`` and ``rstrnt-reboot`` commands are supported
+    for requesting the reboot, variables ``REBOOTCOUNT`` and
+    ``RSTRNT_REBOOTCOUNT`` contain number of reboots as well.
+
 
 Links
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Git:
-https://github.com/psss/tmt
+https://github.com/teemtee/tmt
 
 Docs:
 http://tmt.readthedocs.io/
 
 Stories:
-https://tmt.readthedocs.io/en/latest/stories.html
+https://tmt.readthedocs.io/en/stable/stories.html
 
 Issues:
-https://github.com/psss/tmt/issues
+https://github.com/teemtee/tmt/issues
 
 Releases:
-https://github.com/psss/tmt/releases
+https://github.com/teemtee/tmt/releases
 
 Copr:
 http://copr.fedoraproject.org/coprs/psss/tmt
@@ -362,14 +409,8 @@ http://copr.fedoraproject.org/coprs/psss/tmt
 PIP:
 https://pypi.org/project/tmt/
 
-Travis:
-https://travis-ci.org/psss/tmt
-
-Coveralls:
-https://coveralls.io/github/psss/tmt
-
 Metadata Specification:
-https://tmt.readthedocs.io/en/latest/spec.html
+https://tmt.readthedocs.io/en/stable/spec.html
 
 Flexible Metadata Format:
 http://fmf.readthedocs.io/
@@ -388,8 +429,10 @@ Ruprich, Martin Kyral, Miloš Prchlík, Tomáš Navrátil, František
 Lachman, Patrik Kis, Ondrej Mosnáček, Andrea Ficková, Denis
 Karpelevich, Michal Srb, Jan Ščotka, Artem Zhukov, Vinzenz
 Feenstra, Inessa Vasilevskaya, Štěpán Němec, Robin Hack, Yulia
-Kopkova, Ondrej Moriš, Martin Zelený, Karel Šrot and František
-Zatloukal.
+Kopkova, Ondrej Moriš, Martin Zelený, Karel Šrot, František
+Zatloukal, Simon Walter, Petr Matyáš, Yariv Rachmani, Pavel
+Cahyna, Martin Litwora, Brian Grech, Vojtěch Eichler, Philip Daly,
+Vector Li, Evgeny Fedin, Guy Inger and Petr Matyas.
 
 
 Copyright

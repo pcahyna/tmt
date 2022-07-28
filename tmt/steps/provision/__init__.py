@@ -1,3 +1,6 @@
+import collections
+import dataclasses
+import datetime
 import os
 import random
 import re
@@ -6,16 +9,27 @@ import string
 import subprocess
 import tempfile
 import time
+from typing import Dict, List, Optional, Type
 
 import click
 import fmf
 
 import tmt
+import tmt.steps
+import tmt.utils
+from tmt.steps import Action
 
-# Timeout in seconds of waiting for a connection
-CONNECTION_TIMEOUT = 60 * 4
+# Timeout in seconds of waiting for a connection after reboot
+# (long enough to allow operations such as system upgrade)
+# FIXME: Shorten once "tmt-reboot -t <timeout>" is implemented
+CONNECTION_TIMEOUT = 60 * 60
+
 # Wait time when reboot happens in seconds
-SSH_INITIAL_WAIT_TIME = 5
+RECONNECT_INITIAL_WAIT_TIME = 5
+
+# Default rsync options
+DEFAULT_RSYNC_OPTIONS = [
+    "-R", "-r", "-z", "--links", "--safe-links", "--delete"]
 
 
 class Provision(tmt.steps.Step):
@@ -24,19 +38,37 @@ class Provision(tmt.steps.Step):
     # Default implementation for provision is a virtual machine
     how = 'virtual'
 
-    def __init__(self, data, plan):
+    def __init__(self, plan, data):
         """ Initialize provision step data """
-        super().__init__(data, plan)
+        super().__init__(plan=plan, data=data)
+        # Check that the names are unique
+        names = [data.get('name') for data in self.data]
+        names_count = collections.defaultdict(int)
+        for name in names:
+            names_count[name] += 1
+        if len(self.data) > 1 and len(self.data) != len(names_count):
+            duplicate = [k for k, v in names_count.items() if v > 1]
+            duplicate_string = ', '.join(duplicate)
+            raise tmt.utils.GeneralError(
+                f"Provision step names must be unique for multihost testing. "
+                f"Duplicate names: {duplicate_string} in plan '{plan.name}'.")
         # List of provisioned guests and loaded guest data
-        self._guests = []
-        self._guest_data = {}
+        self._guests: List['Guest'] = []
+        self._guest_data: Dict[str, 'GuestData'] = {}
+        self.is_multihost = False
 
     def load(self, extra_keys=None):
         """ Load guest data from the workdir """
         extra_keys = extra_keys or []
         super().load(extra_keys)
         try:
-            self._guest_data = tmt.utils.yaml_to_dict(self.read('guests.yaml'))
+            raw_guest_data = tmt.utils.yaml_to_dict(self.read('guests.yaml'))
+
+            self._guest_data = {
+                name: tmt.utils.SerializableContainer.unserialize(guest_data)
+                for name, guest_data in raw_guest_data.items()
+                }
+
         except tmt.utils.FileError:
             self.debug('Provisioned guests not found.', level=2)
 
@@ -45,9 +77,10 @@ class Provision(tmt.steps.Step):
         data = data or {}
         super().save(data)
         try:
-            guests = dict(
-                [(guest.name, guest.save()) for guest in self.guests()])
-            self.write('guests.yaml', tmt.utils.dict_to_yaml(guests))
+            raw_guest_data = {guest.name: guest.save().to_serialized()
+                              for guest in self.guests()}
+
+            self.write('guests.yaml', tmt.utils.dict_to_yaml(raw_guest_data))
         except tmt.utils.FileError:
             self.debug('Failed to save provisioned guests.')
 
@@ -58,7 +91,7 @@ class Provision(tmt.steps.Step):
         # Choose the right plugin and wake it up
         for data in self.data:
             plugin = ProvisionPlugin.delegate(self, data)
-            self._plugins.append(plugin)
+            self._phases.append(plugin)
             # If guest data loaded, perform a complete wake up
             plugin.wake(data=self._guest_data.get(plugin.name))
             if plugin.guest():
@@ -102,20 +135,25 @@ class Provision(tmt.steps.Step):
         # Provision guests
         self._guests = []
         save = True
+        self.is_multihost = sum([isinstance(phase, ProvisionPlugin)
+                                for phase in self.phases()]) > 1
         try:
-            for plugin in self.plugins():
+            for phase in self.phases(classes=(Action, ProvisionPlugin)):
                 try:
-                    plugin.go()
-                    if isinstance(plugin, ProvisionPlugin):
-                        plugin.guest().details()
+                    phase.go()
+                    if isinstance(phase, ProvisionPlugin):
+                        phase.guest().details()
+                    if self.is_multihost:
+                        self.info('')
                 finally:
-                    if isinstance(plugin, ProvisionPlugin):
-                        self._guests.append(plugin.guest())
+                    if isinstance(phase, ProvisionPlugin):
+                        if phase.guest():
+                            self._guests.append(phase.guest())
 
             # Give a summary, update status and save
             self.summary()
             self.status('done')
-        except SystemExit as error:
+        except (SystemExit, tmt.utils.SpecificationError) as error:
             # A plugin will only raise SystemExit if the exit is really desired
             # and no other actions should be done. An example of this is
             # listing available images. In such case, the workdir is deleted
@@ -126,7 +164,7 @@ class Provision(tmt.steps.Step):
             if save:
                 self.save()
 
-    def guests(self):
+    def guests(self) -> List['Guest']:
         """ Return the list of all provisioned guests """
         return self._guests
 
@@ -139,12 +177,12 @@ class Provision(tmt.steps.Step):
         Used by the prepare step.
         """
         requires = set()
-        for plugin in self.plugins(classes=ProvisionPlugin):
+        for plugin in self.phases(classes=ProvisionPlugin):
             requires.update(plugin.requires())
         return list(requires)
 
 
-class ProvisionPlugin(tmt.steps.Plugin):
+class ProvisionPlugin(tmt.steps.GuestlessPlugin):
     """ Common parent of provision plugins """
 
     # Default implementation for provision is a virtual machine
@@ -153,8 +191,14 @@ class ProvisionPlugin(tmt.steps.Plugin):
     # List of all supported methods aggregated from all plugins
     _supported_methods = []
 
+    # Common keys for all provision step implementations
+    _common_keys = ['role']
+
     @classmethod
-    def base_command(cls, method_class=None, usage=None):
+    def base_command(
+            cls,
+            usage: str,
+            method_class: Optional[Type[click.Command]] = None) -> click.Command:
         """ Create base click command (common for all provision plugins) """
 
         # Prepare general usage message for the step
@@ -189,7 +233,7 @@ class ProvisionPlugin(tmt.steps.Plugin):
         Each ProvisionPlugin has to implement this method.
         Should return a provisioned Guest() instance.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def requires(self):
         """ List of required packages needed for workdir sync """
@@ -200,33 +244,58 @@ class ProvisionPlugin(tmt.steps.Plugin):
         """ Remove the images of one particular plugin """
 
 
+@dataclasses.dataclass
+class GuestData(tmt.utils.SerializableContainer):
+    """
+    Keys necessary to describe, create, save and restore a guest.
+
+    Very basic set of keys shared across all known guest classes.
+    """
+
+    # guest role in the multihost scenario
+    role: Optional[str] = None
+    # hostname or ip address
+    guest: Optional[str] = None
+
+
 class Guest(tmt.utils.Common):
     """
     Guest provisioned for test execution
 
-    The following keys are expected in the 'data' dictionary::
+    A base class for guest-like classes. Provides some of the basic methods
+    and functionality, but note some of the methods are left intentionally
+    empty. These do not have valid implementation on this level, and it's up
+    to Guest subclasses to provide one working in their respective
+    infrastructure.
 
-        guest ...... hostname or ip address
-        port ....... port to connect to
-        user ....... user name to log in
-        key ........ path to the private key (str or list)
-        password ... password
+    The following keys are expected in the 'data' container::
 
-    These are by default imported into instance attributes (see the
-    class attribute '_keys' below).
+        role ....... guest role in the multihost scenario
+        guest ...... name, hostname or ip address
+
+    These are by default imported into instance attributes.
     """
 
+    # Used by save() to construct the correct container for keys.
+    _data_class = GuestData
+
+    role: Optional[str]
+    guest: Optional[str]
+
+    # Flag to indicate localhost guest, requires special handling
+    localhost = False
+
+    # TODO: do we need this list? Can whatever code is using it use _data_class directly?
     # List of supported keys
     # (used for import/export to/from attributes during load and save)
-    _keys = ['guest', 'port', 'user', 'key', 'password']
+    @property
+    def _keys(self) -> List[str]:
+        return list(self._data_class.keys())
 
-    # Master ssh connection process and socket path
-    _ssh_master_process = None
-    _ssh_socket_path = None
-
-    def __init__(self, data, name=None, parent=None):
+    def __init__(self, data: GuestData, name=None, parent=None):
         """ Initialize guest data """
         super().__init__(parent, name)
+
         self.load(data)
 
     def _random_name(self, prefix='', length=16):
@@ -238,70 +307,12 @@ class Guest(tmt.utils.Common):
         # Return tail (containing random characters) of name
         return name[-length:]
 
-    def _ssh_guest(self):
-        """ Return user@guest """
-        return f'{self.user}@{self.guest}'
+    def _tmt_name(self):
+        """ Generate a name prefixed with tmt run id """
+        _, run_id = os.path.split(self.parent.plan.my_run.workdir)
+        return self._random_name(prefix="tmt-{0}-".format(run_id[-3:]))
 
-    def _ssh_socket(self):
-        """ Prepare path to the master connection socket """
-        if not self._ssh_socket_path:
-            socket_dir = f"/run/user/{os.getuid()}/tmt"
-            os.makedirs(socket_dir, exist_ok=True)
-            self._ssh_socket_path = tempfile.mktemp(dir=socket_dir)
-        return self._ssh_socket_path
-
-    def _ssh_options(self, join=False):
-        """ Return common ssh options (list or joined) """
-        options = [
-            '-oStrictHostKeyChecking=no',
-            '-oUserKnownHostsFile=/dev/null',
-            ]
-        if self.key or self.password:
-            # Skip ssh-agent (it adds additional identities)
-            options.extend(['-oIdentitiesOnly=yes'])
-        if self.port:
-            options.extend(['-p', str(self.port)])
-        if self.key:
-            keys = self.key if isinstance(self.key, list) else [self.key]
-            for key in keys:
-                options.extend(['-i', shlex.quote(key) if join else key])
-        if self.password:
-            options.extend(['-oPasswordAuthentication=yes'])
-
-        # Use the shared master connection
-        options.extend(["-S", self._ssh_socket()])
-
-        return ' '.join(options) if join else options
-
-    def _ssh_master_connection(self, command):
-        """ Check/create the master ssh connection """
-        if self._ssh_master_process:
-            return
-        command = command + self._ssh_options() + ["-MNnT", self._ssh_guest()]
-        self.debug(f"Create the master ssh connection: {' '.join(command)}")
-        self._ssh_master_process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
-
-    def _ssh_command(self, join=False):
-        """ Prepare an ssh command line for execution (list or joined) """
-        command = []
-        if self.password:
-            password = shlex.quote(self.password) if join else self.password
-            command.extend(["sshpass", "-p", password])
-        command.append("ssh")
-
-        # Check the master connection
-        self._ssh_master_connection(command)
-
-        if join:
-            return " ".join(command) + " " + self._ssh_options(join=True)
-        else:
-            return command + self._ssh_options()
-
-    def load(self, data):
+    def load(self, data: GuestData) -> None:
         """
         Load guest data into object attributes for easy access
 
@@ -314,10 +325,9 @@ class Guest(tmt.utils.Common):
         line options / L2 metadata / user configuration and wake up data
         stored by the save() method below.
         """
-        for key in self._keys:
-            setattr(self, key, data.get(key))
+        data.inject_to(self)
 
-    def save(self):
+    def save(self) -> GuestData:
         """
         Save guest data for future wake up
 
@@ -326,12 +336,7 @@ class Guest(tmt.utils.Common):
         the guest. Everything needed to attach to a running instance
         should be added into the data dictionary by child classes.
         """
-        data = dict()
-        for key in self._keys:
-            value = getattr(self, key)
-            if value is not None:
-                data[key] = value
-        return data
+        return self._data_class.extract_from(self)
 
     def wake(self):
         """
@@ -391,14 +396,17 @@ class Guest(tmt.utils.Common):
     def _ansible_verbosity(self):
         """ Prepare verbose level based on the --debug option count """
         if self.opt('debug') < 3:
-            return ''
+            return []
         else:
-            return ' -' + (self.opt('debug') - 2) * 'v'
+            return ['-' + (self.opt('debug') - 2) * 'v']
 
     @staticmethod
     def _ansible_extra_args(extra_args):
         """ Prepare extra arguments for ansible-playbook"""
-        return '' if extra_args is None else str(extra_args)
+        if extra_args is None:
+            return []
+        else:
+            return shlex.split(str(extra_args))
 
     def _ansible_summary(self, output):
         """ Check the output for ansible result summary numbers """
@@ -419,32 +427,294 @@ class Guest(tmt.utils.Common):
         self.debug(f"Playbook full path: '{playbook}'", level=2)
         return playbook
 
-    def _export_environment(self, execute_environment=None):
-        """ Prepare shell export of environment variables """
+    def _prepare_environment(self, execute_environment=None):
+        """ Prepare dict of environment variables """
         # Prepare environment variables so they can be correctly passed
-        # to ssh's shell. Create a copy to prevent modifying source.
+        # to shell. Create a copy to prevent modifying source.
         environment = dict()
         environment.update(execute_environment or dict())
         # Plan environment and variables provided on the command line
         # override environment provided to execute().
         environment.update(self.parent.plan.environment)
-        # Prepend with export and run as a separate command.
+        return environment
+
+    @staticmethod
+    def _export_environment(environment):
+        """ Prepare shell export of environment variables """
         if not environment:
-            return ''
-        return 'export {}; '.format(
-            ' '.join(tmt.utils.shell_variables(environment)))
+            return ""
+        return f'export {" ".join(tmt.utils.shell_variables(environment))}; '
+
+    def ansible(self, playbook, extra_args=None):
+        """ Prepare guest using ansible playbook """
+
+        raise NotImplementedError()
+
+    def execute(self, command, **kwargs):
+        """
+        Execute command on the guest
+
+        command ... string or list of command arguments (required)
+        env ....... dictionary with environment variables
+        cwd ....... working directory to be entered before execution
+
+        If the command is provided as a list, it will be space-joined.
+        If necessary, quote escaping has to be handled by the caller.
+        """
+
+        raise NotImplementedError()
+
+    def push(self, source=None, destination=None, options=None):
+        """
+        Push files to the guest
+        """
+
+        raise NotImplementedError()
+
+    def pull(
+            self,
+            source=None,
+            destination=None,
+            options=None,
+            extend_options=None):
+        """
+        Pull files from the guest
+        """
+
+        raise NotImplementedError()
+
+    def stop(self):
+        """
+        Stop the guest
+
+        Shut down a running guest instance so that it does not consume
+        any memory or cpu resources. If needed, perform any actions
+        necessary to store the instance status to disk.
+        """
+
+        raise NotImplementedError()
+
+    def reboot(self, hard=False):
+        """
+        Reboot the guest, return True if successful
+
+        Parameter 'hard' set to True means that guest should be
+        rebooted by way which is not clean in sense that data can be
+        lost. When set to False reboot should be done gracefully.
+        """
+
+        raise NotImplementedError()
+
+    def reconnect(self, timeout=CONNECTION_TIMEOUT):
+        """
+        Ensure the connection to the guest is working after reboot
+
+        The default timeout is 1h to allow long operations such as
+        system upgrade. Custom number of seconds can be provided in the
+        `timeout` parameter.
+        """
+        # Try to wait for machine to really shutdown
+        time.sleep(RECONNECT_INITIAL_WAIT_TIME)
+        self.debug("Wait for a connection to the guest.")
+
+        # A small shortcut... `now` or `utcnow`, should not matter, becase we
+        # need a difference between two values. As long as we use the same
+        # function for both sides of the equation, we should be fine.
+        now = datetime.datetime.utcnow
+        deadline = now() + datetime.timedelta(seconds=timeout)
+        while now() < deadline:
+            try:
+                self.execute('whoami')
+                break
+            except tmt.utils.RunError:
+                self.debug('Failed to connect to the guest, retrying.')
+                time.sleep(1)
+        else:
+            self.debug("Connection to guest failed after reboot.")
+            return False
+        return True
+
+    def remove(self):
+        """
+        Remove the guest
+
+        Completely remove all guest instance data so that it does not
+        consume any disk resources.
+        """
+        self.debug(f"Doing nothing to remove guest '{self.guest}'.")
+
+    def _check_rsync(self):
+        """
+        Make sure that rsync is installed on the guest
+
+        On read-only distros install it under the '/root/pkg' directory.
+        Returns 'already installed' when rsync is already present.
+        """
+
+        # Check for rsync (nothing to do if already installed)
+        self.debug("Ensure that rsync is installed on the guest.")
+        try:
+            self.execute("rsync --version")
+            return "already installed"
+        except tmt.utils.RunError:
+            pass
+
+        # Check the package manager
+        self.debug("Check the package manager.")
+        try:
+            self.execute("dnf --version")
+            package_manager = "dnf"
+        except tmt.utils.RunError:
+            package_manager = "yum"
+
+        # Install under '/root/pkg' for read-only distros
+        # (for now the check is based on 'rpm-ostree' presence)
+        # FIXME: Find a better way how to detect read-only distros
+        self.debug("Check for a read-only distro.")
+        try:
+            self.execute("rpm-ostree --version")
+            readonly = (
+                " --installroot=/root/pkg --releasever / "
+                "&& ln -sf /root/pkg/bin/rsync /usr/local/bin/rsync")
+        except tmt.utils.RunError:
+            readonly = ""
+
+        # Install the rsync
+        self.execute(f"{package_manager} install -y rsync" + readonly)
+
+    @classmethod
+    def requires(cls):
+        """ No extra requires needed """
+        return []
+
+
+@dataclasses.dataclass
+class GuestSshData(GuestData):
+    """
+    Keys necessary to describe, create, save and restore a guest with SSH
+    capability.
+
+    Derived from GuestData, this class adds keys relevant for guests that can be
+    reached over SSH.
+    """
+
+    # port to connect to
+    port: Optional[int] = None
+    # user name to log in
+    user: Optional[str] = None
+    # path to the private key
+    key: List[str] = dataclasses.field(default_factory=list)
+    # password
+    password: Optional[str] = None
+
+
+class GuestSsh(Guest):
+    """
+    Guest provisioned for test execution, capable of accepting SSH connections
+
+    The following keys are expected in the 'data' dictionary::
+
+        role ....... guest role in the multihost scenario (inherited)
+        guest ...... hostname or ip address (inherited)
+        port ....... port to connect to
+        user ....... user name to log in
+        key ........ path to the private key (str or list)
+        password ... password
+
+    These are by default imported into instance attributes.
+    """
+
+    _data_class = GuestSshData
+
+    port: Optional[int]
+    user: Optional[str]
+    key: List[str]
+    password: Optional[str]
+
+    # Master ssh connection process and socket path
+    _ssh_master_process = None
+    _ssh_socket_path = None
+
+    def _ssh_guest(self):
+        """ Return user@guest """
+        return f'{self.user}@{self.guest}'
+
+    def _ssh_socket(self):
+        """ Prepare path to the master connection socket """
+        if not self._ssh_socket_path:
+            # Use '/run/user/uid' if it exists, '/tmp' otherwise
+            run_dir = f"/run/user/{os.getuid()}"
+            if os.path.isdir(run_dir):
+                socket_dir = os.path.join(run_dir, "tmt")
+            else:
+                socket_dir = "/tmp"
+            os.makedirs(socket_dir, exist_ok=True)
+            self._ssh_socket_path = tempfile.mktemp(dir=socket_dir)
+        return self._ssh_socket_path
+
+    def _ssh_options(self, join=False):
+        """ Return common ssh options (list or joined) """
+        options = [
+            '-oForwardX11=no',
+            '-oStrictHostKeyChecking=no',
+            '-oUserKnownHostsFile=/dev/null',
+            ]
+        if self.key or self.password:
+            # Skip ssh-agent (it adds additional identities)
+            options.append('-oIdentitiesOnly=yes')
+        if self.port:
+            options.append(f'-p{self.port}')
+        if self.key:
+            keys = self.key if isinstance(self.key, list) else [self.key]
+            for key in keys:
+                options.append(f'-i{shlex.quote(key) if join else key}')
+        if self.password:
+            options.extend(['-oPasswordAuthentication=yes'])
+
+        # Use the shared master connection
+        options.append(f'-S{self._ssh_socket()}')
+
+        return ' '.join(options) if join else options
+
+    def _ssh_master_connection(self, command):
+        """ Check/create the master ssh connection """
+        if self._ssh_master_process:
+            return
+        command = command + self._ssh_options() + ["-MNnT", self._ssh_guest()]
+        self.debug(f"Create the master ssh connection: {' '.join(command)}")
+        self._ssh_master_process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+
+    def _ssh_command(self, join=False):
+        """ Prepare an ssh command line for execution (list or joined) """
+        command = []
+        if self.password:
+            password = shlex.quote(self.password) if join else self.password
+            command.extend(["sshpass", "-p", password])
+        command.append("ssh")
+
+        # Check the master connection
+        self._ssh_master_connection(command)
+
+        if join:
+            return " ".join(command) + " " + self._ssh_options(join=True)
+        else:
+            return command + self._ssh_options()
 
     def ansible(self, playbook, extra_args=None):
         """ Prepare guest using ansible playbook """
         playbook = self._ansible_playbook_path(playbook)
         stdout, stderr = self.run(
-            f'{self._export_environment()}'
-            f'stty cols {tmt.utils.OUTPUT_WIDTH}; ansible-playbook '
-            f'--ssh-common-args="{self._ssh_options(join=True)}" '
-            f'{self._ansible_verbosity()} '
-            f'{self._ansible_extra_args(extra_args)} -i {self._ssh_guest()},'
-            f' {playbook}',
-            cwd=self.parent.plan.worktree)
+            ['ansible-playbook'] +
+            self._ansible_verbosity() +
+            self._ansible_extra_args(extra_args) +
+            [f'--ssh-common-args={self._ssh_options(join=True)}'] +
+            ['-i', f'{self._ssh_guest()},', playbook],
+            cwd=self.parent.plan.worktree,
+            env=self._prepare_environment())
         self._ansible_summary(stdout)
 
     def execute(self, command, **kwargs):
@@ -460,7 +730,8 @@ class Guest(tmt.utils.Common):
         """
 
         # Prepare the export of environment variables
-        environment = self._export_environment(kwargs.get('env', dict()))
+        environment = self._export_environment(
+            self._prepare_environment(kwargs.get('env', dict())))
 
         # Change to given directory on guest if cwd provided
         directory = kwargs.get('cwd') or ''
@@ -477,7 +748,7 @@ class Guest(tmt.utils.Common):
         command = (
             self._ssh_command() + interactive + [self._ssh_guest()] +
             [f'{environment}{directory}{command}'])
-        return self.run(command, shell=False, **kwargs)
+        return self.run(command, **kwargs)
 
     def push(self, source=None, destination=None, options=None):
         """
@@ -488,9 +759,9 @@ class Guest(tmt.utils.Common):
         location and the 'options' parametr to modify default options
         which are '-Rrz --links --safe-links --delete'.
         """
-        # Prepare options
+        # Prepare options and the push command
         if options is None:
-            options = "-Rrz --links --safe-links --delete".split()
+            options = DEFAULT_RSYNC_OPTIONS
         if destination is None:
             destination = "/"
         if source is None:
@@ -498,33 +769,49 @@ class Guest(tmt.utils.Common):
             self.debug(f"Push workdir to guest '{self.guest}'.")
         else:
             self.debug(f"Copy '{source}' to '{destination}' on the guest.")
-        # Make sure rsync is present (tests can remove it) and sync
-        self._check_rsync()
-        try:
+
+        def rsync():
+            """ Run the rsync command """
             self.run(
                 ["rsync"] + options
                 + ["-e", self._ssh_command(join=True)]
-                + [source, f"{self._ssh_guest()}:{destination}"],
-                shell=False)
-        except tmt.utils.RunError:
-            # Provide a reasonable error to the user
-            self.fail(
-                f"Failed to push workdir to the guest. This usually means "
-                f"login as '{self.user}' to the test machine does not work.")
-            raise
+                + [source, f"{self._ssh_guest()}:{destination}"])
 
-    def pull(self, source=None, destination=None, options=None):
+        # Try to push twice, check for rsync after the first failure
+        try:
+            rsync()
+        except tmt.utils.RunError:
+            try:
+                if self._check_rsync() == "already installed":
+                    raise
+                rsync()
+            except tmt.utils.RunError:
+                # Provide a reasonable error to the user
+                self.fail(
+                    f"Failed to push workdir to the guest. This usually means "
+                    f"that login as '{self.user}' to the guest does not work.")
+                raise
+
+    def pull(
+            self,
+            source=None,
+            destination=None,
+            options=None,
+            extend_options=None):
         """
         Pull files from the guest
 
         By default the whole plan workdir is synced from the same
         location on the guest. Use the 'source' and 'destination' to
-        sync custom location and the 'options' parametr to modify
-        default options '-Rrz --links --safe-links --protect-args'.
+        sync custom location, the 'options' parameter to modify
+        default options '-Rrz --links --safe-links --protect-args'
+        and 'extend_options' to extend them (e.g. by exclude).
         """
-        # Prepare options
+        # Prepare options and the pull command
         if options is None:
             options = "-Rrz --links --safe-links --protect-args".split()
+        if extend_options is not None:
+            options.extend(extend_options)
         if destination is None:
             destination = "/"
         if source is None:
@@ -532,13 +819,29 @@ class Guest(tmt.utils.Common):
             self.debug(f"Pull workdir from guest '{self.guest}'.")
         else:
             self.debug(f"Copy '{source}' from the guest to '{destination}'.")
-        # Make sure rsync is present (tests can remove it) and sync
-        self._check_rsync()
-        self.run(
-            ["rsync"] + options
-            + ["-e", self._ssh_command(join=True)]
-            + [f"{self._ssh_guest()}:{source}", destination],
-            shell=False)
+
+        def rsync():
+            """ Run the rsync command """
+            self.run(
+                ["rsync"] + options
+                + ["-e", self._ssh_command(join=True)]
+                + [f"{self._ssh_guest()}:{source}", destination])
+
+        # Try to pull twice, check for rsync after the first failure
+        try:
+            rsync()
+        except tmt.utils.RunError:
+            try:
+                if self._check_rsync() == "already installed":
+                    raise
+                rsync()
+            except tmt.utils.RunError:
+                # Provide a reasonable error to the user
+                self.fail(
+                    f"Failed to pull workdir from the guest. "
+                    f"This usually means that login as '{self.user}' "
+                    f"to the guest does not work.")
+                raise
 
     def stop(self):
         """
@@ -567,47 +870,35 @@ class Guest(tmt.utils.Common):
             except OSError as error:
                 self.debug(f"Failed to remove the socket: {error}", level=3)
 
-    def reboot(self, hard=False):
+    def reboot(self, hard=False, command=None):
         """
         Reboot the guest, return True if successful
 
         Parameter 'hard' set to True means that guest should be
         rebooted by way which is not clean in sense that data can be
         lost. When set to False reboot should be done gracefully.
+
+        Use the 'command' parameter to specify a custom reboot command
+        instead of the default 'reboot'.
         """
+
         if hard:
             raise tmt.utils.ProvisionError(
                 "Method does not support hard reboot.")
 
         try:
-            self.execute("reboot")
+            command = command or "reboot"
+            self.debug(f"Reboot using the command '{command}'.")
+            self.execute(command)
         except tmt.utils.RunError as error:
             # Connection can be closed by the remote host even before the
             # reboot command is completed. Let's ignore such errors.
             if error.returncode == 255:
                 self.debug(
-                    f"Seems the connection was closed too fast, ignoring.")
+                    "Seems the connection was closed too fast, ignoring.")
             else:
                 raise
         return self.reconnect()
-
-    def reconnect(self):
-        """ Ensure the connection to the guest is working after reboot """
-        # Try to wait for machine to really shutdown sshd
-        time.sleep(SSH_INITIAL_WAIT_TIME)
-        self.debug("Wait for a connection to the guest.")
-        for attempt in range(1, CONNECTION_TIMEOUT):
-            try:
-                self.execute('whoami')
-                break
-            except tmt.utils.RunError:
-                self.debug('Failed to connect to the guest, retrying.')
-                time.sleep(1)
-
-        if attempt == CONNECTION_TIMEOUT:
-            self.debug("Connection to guest failed after reboot.")
-            return False
-        return True
 
     def remove(self):
         """
@@ -622,10 +913,40 @@ class Guest(tmt.utils.Common):
         """
         Make sure that rsync is installed on the guest
 
-        For now works only with RHEL based distributions.
+        On read-only distros install it under the '/root/pkg' directory.
+        Returns 'already installed' when rsync is already present.
         """
-        self.debug("Ensure that rsync is installed on the guest.", level=3)
-        self.execute("rpm -q rsync || yum install -y rsync")
+
+        # Check for rsync (nothing to do if already installed)
+        self.debug("Ensure that rsync is installed on the guest.")
+        try:
+            self.execute("rsync --version")
+            return "already installed"
+        except tmt.utils.RunError:
+            pass
+
+        # Check the package manager
+        self.debug("Check the package manager.")
+        try:
+            self.execute("dnf --version")
+            package_manager = "dnf"
+        except tmt.utils.RunError:
+            package_manager = "yum"
+
+        # Install under '/root/pkg' for read-only distros
+        # (for now the check is based on 'rpm-ostree' presence)
+        # FIXME: Find a better way how to detect read-only distros
+        self.debug("Check for a read-only distro.")
+        try:
+            self.execute("rpm-ostree --version")
+            readonly = (
+                " --installroot=/root/pkg --releasever / "
+                "&& ln -sf /root/pkg/bin/rsync /usr/local/bin/rsync")
+        except tmt.utils.RunError:
+            readonly = ""
+
+        # Install the rsync
+        self.execute(f"{package_manager} install -y rsync" + readonly)
 
     @classmethod
     def requires(cls):

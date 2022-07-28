@@ -8,15 +8,19 @@ story:
 description:
     When there are several people collaborating on tests it's
     useful to have a way how find who is responsible for what.
-    Should be a ``string`` or a ``list of strings`` (email address
+    Must be a ``string`` or a ``list of strings`` (email address
     format with name and surname).
 
-example: |
+example:
+  - |
+    # Single contact
     contact: Name Surname <email@address.org>
 
+  - |
+    # Multiple contacts
     contact:
-        - First Person <first@address.org>
-        - Second Person <second@address.org>
+      - First Person <first@address.org>
+      - Second Person <second@address.org>
 
 link:
   - implemented-by: /tmt/base.py

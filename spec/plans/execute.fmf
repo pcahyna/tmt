@@ -18,7 +18,7 @@ description: |
     :ref:`/spec/tests` attributes it also contains fmf ``name`` of
     the test.
 
-    For each ``plan`` the execute step should produce a
+    For each ``plan`` the execute step must produce a
     ``results.yaml`` file with the list of results for each test
     in the following format::
 
@@ -40,18 +40,18 @@ description: |
             Test finished but only produced an informational
             message. Represents a soft pass, used for skipped
             tests and for tests with the :ref:`/spec/tests/result`
-            attribute set to *ignore*. Automation should treat
+            attribute set to *ignore*. Automation must treat
             this as a passed test.
         warn
             A problem appeared during test execution which does
             not affect test results but might be worth checking
             and fixing. For example test cleanup phase failed.
-            Automation should treat this as a failed test.
+            Automation must treat this as a failed test.
         error
             Undefined problem encountered during test execution.
             Human inspection is needed to investigate whether it
             was a test bug, infrastructure error or a real test
-            failure. Automation should treat it as a failed test.
+            failure. Automation must treat it as a failed test.
         fail
             Test execution successfully finished and failed.
 
@@ -63,6 +63,82 @@ description: |
 
     The ``DURATION`` is an optional section stating how long did
     the test run. Its value is in the ``hh:mm:ss`` format.
+
+/upgrade:
+    summary: Perform system upgrades during testing
+    story:
+        As a tester I want to verify that a configured application
+        or service still correctly works after the system upgrade.
+    description: |
+        In order to enable developing tests for upgrade testing, we
+        need to provide a way how to execute these tests easily.
+        This does not cover unit tests for individual actors but
+        rather system tests which verify the whole upgrade story.
+
+        The ``upgrade`` executor runs the discovered tests (using
+        the internal executor, hence the same config options can
+        be used), then performs a set of upgrade tasks from
+        a remote repository, and finally, re-runs the tests on
+        the upgraded system.
+
+        The ``IN_PLACE_UPGRADE`` environment variable is set during
+        the test execution to differentiate between the stages of
+        the test. It is set to ``old`` during the first execution
+        and ``new`` during the second execution. Test names are
+        prefixed with this value to make the names unique.
+        Based on this variable, the test can perform appropriate
+        actions.
+
+        old
+            setup, test
+        new
+            test, cleanup
+        without
+            setup, test, cleanup
+
+        The upgrade tasks performing the actual system upgrade are
+        taken from a remote repository (specified by the ``url`` key)
+        based on an upgrade path (specified by the ``upgrade-path`` key)
+        or other filters (e.g. specified by the ``filter`` key).
+        If both ``upgrade-path`` and extra filters are specified,
+        the discover keys in the remote upgrade path plan are overridden
+        by the filters specified in the local plan.
+
+        The upgrade path must correspond to a plan name in the remote
+        repository whose discover selects tests (upgrade tasks).
+        The environment variables defined in the upgrade path are passed
+        to the upgrade tasks.
+    example:
+      - |
+        # Main testing plan
+        discover:
+            how: fmf
+        execute:
+            how: upgrade
+            url: https://github.com/teemtee/upgrade
+            upgrade-path: /paths/fedora35to36
+
+      - |
+        # Upgrade path /paths/fedora35to36.fmf in the remote repository
+        discover: # Selects appropriate upgrade tasks (L1 tests)
+            how: fmf
+            filter: "tag:fedora"
+        environment: # This is passed to upgrade tasks
+            SOURCE: 35
+            TARGET: 36
+        execute:
+            how: tmt
+
+      - |
+        # Alternative main testing plan, without upgrade path
+        execute:
+            how: upgrade
+            url: https://github.com/teemtee/upgrade
+            filter: "tag:fedora"
+    link:
+      - implemented-by: /tmt/steps/execute/upgrade.py
+      - verified-by: /tests/execute/upgrade
+
 
 /isolate:
     summary: Run tests in an isolated environment
@@ -82,28 +158,58 @@ description: |
     description:
         Optional boolean attribute `exit-first` can be used to
         make the executor stop executing tests once a test
-        failure is encountered. Currently, both
-        :ref:`/spec/plans/execute/tmt` and
-        :ref:`/spec/plans/execute/detach` executors support this.
+        failure is encountered.
     example: |
         execute:
             how: tmt
             exit-first: true
     link:
       - implemented-by: /tmt/steps/execute/internal.py
-      - implemented-by: /tmt/steps/execute/detach.py
       - verified-by: /tests/execute/exit-first
 
 /tmt:
     summary: Internal test executor
     story: As a user I want to execute tests directly from tmt.
-    description:
+    description: |
         The internal ``tmt`` executor runs tests in the
         provisioned environment one by one directly from the
         tmt code which allows features such as showing live
         :ref:`/stories/cli/steps/execute/progress` or the
         :ref:`/stories/cli/steps/execute/interactive` session .
         This is the default execute step implementation.
+
+        The executor provides following shell scripts which can
+        be used by the tests for certain operations.
+
+        ``tmt-file-submit``
+            Archive the given file in the tmt test data directory.
+            See the :ref:`/stories/features/report-log` section
+            for more details.
+
+        ``tmt-reboot``
+            Soft reboot the machine from inside the test. After reboot
+            the execution starts from the test which rebooted the machine.
+            An environment variable ``TMT_REBOOT_COUNT`` is provided which
+            the test can use to handle the reboot. The variable holds the
+            number of reboots performed by the test. For more information
+            see the :ref:`/stories/features/reboot` feature documentation.
+
+        ``tmt-report-result``
+            Generate a result report file from inside the test. Can be
+            called multiple times by the test. The generated report
+            file will be overwritten if a higher hierarchical result is
+            reported by the test. The hierarchy is as follows:
+            SKIP, PASS, WARN, FAIL.
+            For more information see the
+            :ref:`/stories/features/report-result` feature documentation.
+
+        ``tmt-abort``
+            Generate an abort file from inside the test. This will
+            set the current test result to failed and terminate
+            the execution of subsequent tests.
+            For more information see the
+            :ref:`/stories/features/abort` feature documentation.
+
     example: |
         execute:
             how: tmt
@@ -111,75 +217,63 @@ description: |
       - implemented-by: /tmt/steps/execute/internal.py
       - verified-by: /tests/execute/framework
 
-/detach:
-    summary: Detached test executor
-    story: As a user I want to execute tests in a detached way.
-    description:
-        The ``detach`` executor runs tests in one batch using a
-        shell script directly executed on the provisioned guest.
-        This can be useful when the connection to the guest is
-        slow or the test execution takes a long time and you want
-        to disconnect your laptop while keeping tests running in
-        the background.
-    example: |
-        execute:
-            how: detach
-    link:
-      - implemented-by: /tmt/steps/execute/detach.py
-      - verified-by: /tests/execute/framework
-
-/on:
+/where:
     summary: Execute tests on selected guests
     description: |
         In the :ref:`/spec/plans/provision/multihost` scenarios it
         is often necessary to execute test code on selected guests
         only or execute different test code on individual guests.
-        The ``on`` key allows to select guests where the tests
+        The ``where`` key allows to select guests where the tests
         should be executed by providing their ``name`` or the
         ``role`` they play in the scenario. Use a list to specify
-        multiple names or roles. By default, when the ``on`` key
+        multiple names or roles. By default, when the ``where`` key
         is not defined, tests are executed on all provisioned
         guests.
     example: |
-        # Execute discovered tests on the client
+        # Execute discovered tests on the client (already supported)
         execute:
           - how: tmt
-            on: client
+            where: client
 
-        # Run different script for each role
+        # Run different script for each role (not supported yet)
         execute:
           - name: run-the-client-code
             script: client.py
-            on: client
+            where: client
           - name: run-the-server-code
             script: server.py
-            on: server
+            where: server
 
 /script:
     summary: Execute shell scripts
     story: As a user I want to easily run shell script as a test.
-    description:
+    description: |
         Execute arbitratry shell commands and check their exit
-        code which is used as a test result.
+        code which is used as a test result. The ``script`` field
+        is provided to cover simple test use cases only and must
+        not be combined with the :ref:`/spec/plans/discover` step
+        which is more suitable for more complex test scenarios.
 
         Default shell options are applied to the script, see
-        :ref:`/spec/tests/test` for more details.
+        :ref:`/spec/tests/test` for more details. The default
+        :ref:`/spec/tests/duration` for tests defined directly
+        under the execute step is ``1h``. Use the ``duration``
+        attribute to modify the default limit.
 
-        The default :ref:`/spec/tests/duration` for tests defined
-        directly under the execute step is ``1h``. Use the
-        ``duration`` attribute to modify the default limit.
-    example: |
+    example:
+      - |
+        # Run a simple smoke test
         execute:
             how: tmt
             script: tmt --help
-
+      - |
+        # Modify the default maximum duration
         execute:
             how: tmt
             script: a-long-test-suite
             duration: 3h
     link:
       - implemented-by: /tmt/steps/execute/internal.py
-      - implemented-by: /tmt/steps/execute/detach.py
 
     /simple:
         summary: Simple use case should be super simple to write
@@ -203,18 +297,20 @@ description: |
         example: |
             execute:
                 script:
-                    - dnf -y install httpd curl
-                    - systemctl start httpd
-                    - echo foo > /var/www/html/index.html
-                    - curl http://localhost/ | grep foo
+                  - dnf -y install httpd curl
+                  - systemctl start httpd
+                  - echo foo > /var/www/html/index.html
+                  - curl http://localhost/ | grep foo
 
     /multi:
         summary: Multi-line shell script
         title: Multi-line script
         description:
             Providing a multi-line shell script is also supported.
-            In that case executor will store given script into a
-            file and execute.
+            Note that the first command with non-zero exit code
+            will finish the execution. See the
+            :ref:`/spec/tests/test` key for details about default
+            shell options.
         example: |
             execute:
                 script: |

@@ -189,6 +189,56 @@ rlJournalStart
         rlRun "rm -rf $run" 0 "Clean up run"
     rlPhaseEnd
 
+    rlPhaseStartTest "Select by test --name . "
+        rlRun "pushd subdir"
+        run=$(mktemp -d)
+
+        rlRun "tmt -c subdir=1 run --id $run discover tests --name ."
+        # only /subdir test is selected by /plans/all and /plans/filtered
+        for plan in all filtered; do
+            rlAssertEquals "just /subdir in $plan" \
+                "$(grep '^/' $run/plans/$plan/discover/tests.yaml)" "/subdir:"
+        done
+        # other two plans don't select any test
+        for plan in duplicate selected; do
+            rlAssertEquals "no test selected in $plan" \
+                "$(cat $run/plans/$plan/discover/tests.yaml)" "{}"
+        done
+
+        rlRun "rm -rf $run" 0 "Clean up run"
+
+        # Common prefix should not be selected
+        rlRun -s "tmt tests ls ."
+        rlAssertGrep "/subdir" "$rlRun_LOG"
+        rlAssertNotGrep "/subdir_other" "$rlRun_LOG"
+
+        # Now get out of "subdir"
+        rlRun "popd"
+
+        # Virtual cases defined in /sub/ (no other tests should be selected)
+        rlRun "pushd sub"
+        rlRun -s "tmt tests ls ."
+        rlAssertGrep "/sub/first" "$rlRun_LOG"
+        rlAssertGrep "/sub/second" "$rlRun_LOG"
+        rlAssertNotGrep "/subdir" "$rlRun_LOG"
+        rlRun "popd"
+
+        # In top dir all tests should be selected
+        rlRun -s "tmt tests ls ."
+        rlAssertGrep "/sub/first" "$rlRun_LOG"
+        rlAssertGrep "/subdir" "$rlRun_LOG"
+        rlAssertGrep "/tests" "$rlRun_LOG"
+    rlPhaseEnd
+
+    for exclude in '-x' '--exclude'; do
+        rlPhaseStartTest "tmt test ls $exclude <regex>"
+            rlRun "tmt test ls | tee $output"
+            rlAssertGrep "/tests/enabled/default" $output
+            rlRun "tmt test ls $exclude default | tee $output"
+            rlAssertNotGrep "/tests/enabled/default" $output
+        rlPhaseEnd
+    done
+
     rlPhaseStartCleanup
         rlRun "popd"
         rlRun "rm $output" 0 "Remove output file"

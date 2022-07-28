@@ -1,143 +1,23 @@
 import os
 import os.path
+import types
 import webbrowser
+from typing import List, Optional
 
 import click
+import pkg_resources
 
 import tmt
+import tmt.options
+import tmt.steps.report
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<head>
-    <title>Test results of {{ plan.name }}</title>
-    <style>
-        body {
-            background: #eee;
-            padding: 3em;
-            font-family: sans-serif;
-            text-align: center;
-        }
+HTML_TEMPLATE_PATH = pkg_resources.resource_filename(
+    'tmt', 'steps/report/html/template.html.j2')
 
-        div {
-            display: inline-block;
-            text-align: left;
-            background: white;
-            padding: 2em;
-            border-radius: 1ex;
-        }
-
-        a {
-            color: #29f;
-            text-decoration: none;
-        }
-
-        a:hover {
-            text-decoration: underline;
-        }
-
-        h1 {
-            color: #aaa;
-            margin: 0ex 0ex 1ex 7px;
-        }
-
-        h2 {
-            color: #555;
-            margin: -1ex 0ex 1ex 7px;
-        }
-
-        p.footer {
-            margin: 30px 7px 0px 7px;
-        }
-
-        table {
-            border-spacing: 7px;
-        }
-
-        td, th {
-            padding: 0.7ex 1em;
-        }
-
-        td {
-            background: #f8f8f8;
-            border-radius: 0.5ex;
-        }
-
-        td.result {
-            text-align: center;
-            text-shadow: 0px 0px 5px #555;
-            color: white;
-        }
-
-        td.pass {
-            background: #0a0;
-        }
-
-        td.fail {
-            background: #d30;
-        }
-
-        td.info {
-            background: #58d;
-        }
-
-        td.warn {
-            background: #fc5;
-        }
-
-        td.error {
-            background: #b4d;
-        }
-
-        td.log {
-            word-spacing: 1ex;
-        }
-
-        td.note {
-            color: #c00;
-        }
-    </style>
-</head>
-<body>
-<div>
-<h1>{{ plan.name }}</h1>
-{% if plan.summary %}<h2>{{ plan.summary }}</h2>{% endif %}
-{% if results %}
-<table>
-    <thead>
-        <tr>
-            <th>Result</th>
-            <th>Test</th>
-            <th>Logs</th>
-        </tr>
-    </thead>
-    {% for result in results %}
-    <tr class="result {{ loop.cycle('odd', 'even') }}">
-        <td class="result {{ result.result|e }}"> {{ result.result|e }}</td>
-        <td class="name"> {{ result.name|e }}</td>
-        <td class="log">
-        {% for log in result.log %}
-            <a href="{{ base_dir }}/{{ log }}">{{ log | basename }}</a>
-        {% endfor %}
-        </td>
-        {% if result.note %}
-        <td class="note">{{ result.note|e }}</td>
-        {% endif %}
-    </tr>
-    {% endfor %}
-</table>
-{% else %}
-<b>No test results found.</b>
-{% endif %}
-<p class="footer">
-    Links: <a href="{{ plan.my_run.workdir }}/log.txt">full debug log</a>
-</p>
-</div>
-</body>
-</html>
-""".strip()
+jinja2: Optional[types.ModuleType] = None
 
 
-def import_jinja2():
+def import_jinja2() -> None:
     """
     Import jinja2 module only when needed
 
@@ -169,24 +49,30 @@ class ReportHtml(tmt.steps.report.ReportPlugin):
     _keys = ["open"]
 
     @classmethod
-    def options(cls, how=None):
+    def options(cls, how: Optional[str] = None) -> List[tmt.options.ClickOptionDecoratorType]:
         """ Prepare command line options for the html report """
-        return [
+        options = super().options(how)
+        options[:0] = [
             click.option(
                 '-o', '--open', is_flag=True,
                 help='Open results in your preferred web browser.'),
-            ] + super().options(how)
+            ]
+        return options
 
-    def go(self):
+    def go(self) -> None:
         """ Process results """
         super().go()
 
         import_jinja2()
+        assert jinja2
 
         # Prepare the template
         environment = jinja2.Environment()
         environment.filters["basename"] = lambda x: os.path.basename(x)
-        template = environment.from_string(HTML_TEMPLATE)
+        environment.trim_blocks = True
+        environment.lstrip_blocks = True
+        with open(HTML_TEMPLATE_PATH) as file:
+            template = environment.from_string(file.read())
 
         # Write the report
         filename = 'index.html'
@@ -202,6 +88,7 @@ class ReportHtml(tmt.steps.report.ReportPlugin):
             return
 
         # Show output file path
+        assert self.workdir is not None
         target = os.path.join(self.workdir, filename)
         self.info("output", target, color='yellow')
         if not self.get('open'):
@@ -214,7 +101,7 @@ class ReportHtml(tmt.steps.report.ReportPlugin):
                     'open', 'Successfully opened in the web browser.',
                     color='green')
                 return
-            self.fail(f"Failed to open the web browser.")
+            self.fail("Failed to open the web browser.")
         except Exception as error:
             self.fail(f"Failed to open the web browser: {error}")
 

@@ -9,17 +9,22 @@ description: |
     Even if a test fails it might makes sense to execute it to be
     able to manually review the results (ignore test result) or
     ensure the behaviour has not unexpectedly changed and the test
-    is still failing (expected fail). The following values should
-    be supported:
+    is still failing (expected fail). The following values are
+    supported:
 
     respect
         test result is respected (fails when test failed)
-    ignore
-        ignore the test result (test always passes)
     xfail
         expected fail (pass when test fails, fail when test passes)
+    pass, info, warn, error, fail
+        ignore the actual test result and always report provided
+        value instead
 
     The default value is ``respect``.
 
 example: |
-    result: ignore
+    result: xfail
+
+link:
+  - implemented-by: /tmt/base.py
+  - verified-by: /tests/execute/result

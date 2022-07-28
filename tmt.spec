@@ -1,14 +1,21 @@
 Name: tmt
-Version: 1.9.0
+Version: 1.15.0
 Release: 1%{?dist}
 
 Summary: Test Management Tool
 License: MIT
 BuildArch: noarch
-%{?kernel_arches:ExclusiveArch: %{kernel_arches} noarch}
 
-URL: https://github.com/psss/tmt
-Source0: https://github.com/psss/tmt/releases/download/%{version}/tmt-%{version}.tar.gz
+# Build only on arches where libguestfs (needed by testcloud) is available
+%{?kernel_arches:ExclusiveArch: %{kernel_arches} noarch}
+%if 0%{?rhel} >= 9
+ExcludeArch: %{power64}
+%endif
+
+URL: https://github.com/teemtee/tmt
+Source0: https://github.com/teemtee/tmt/releases/download/%{version}/tmt-%{version}.tar.gz
+
+%define workdir_root /var/tmp/tmt
 
 # Main tmt package requires the Python module
 Requires: python%{python3_pkgversion}-%{name} == %{version}-%{release}
@@ -25,16 +32,22 @@ This package contains the command line tool.
 %package -n     python%{python3_pkgversion}-%{name}
 Summary:        Python library for the %{summary}
 BuildRequires: python%{python3_pkgversion}-devel
+BuildRequires: python%{python3_pkgversion}-docutils
 BuildRequires: python%{python3_pkgversion}-setuptools
 BuildRequires: python%{python3_pkgversion}-pytest
 BuildRequires: python%{python3_pkgversion}-click
-BuildRequires: python%{python3_pkgversion}-fmf
-BuildRequires: python%{python3_pkgversion}-mock
+BuildRequires: python%{python3_pkgversion}-fmf >= 1.1.0
 BuildRequires: python%{python3_pkgversion}-requests
-BuildRequires: python%{python3_pkgversion}-testcloud
+BuildRequires: python%{python3_pkgversion}-testcloud >= 0.8.1
 BuildRequires: python%{python3_pkgversion}-markdown
 BuildRequires: python%{python3_pkgversion}-junit_xml
 BuildRequires: python%{python3_pkgversion}-ruamel-yaml
+# Only needed for rhel-8 (it has python3.6)
+%if 0%{?rhel} == 8
+BuildRequires: python%{python3_pkgversion}-typing-extensions
+BuildRequires: python%{python3_pkgversion}-dataclasses
+BuildRequires: python%{python3_pkgversion}-importlib-metadata
+%endif
 # Required for tests
 BuildRequires: rsync
 %{?python_provide:%python_provide python%{python3_pkgversion}-%{name}}
@@ -48,7 +61,8 @@ This package contains the Python 3 module.
 Summary: Container provisioner for the Test Management Tool
 Obsoletes: tmt-container < 0.17
 Requires: tmt == %{version}-%{release}
-Requires: ansible podman
+Requires: podman
+Requires: (ansible or ansible-collection-containers-podman)
 
 %description provision-container
 Dependencies required to run tests in a container environment.
@@ -57,14 +71,23 @@ Dependencies required to run tests in a container environment.
 Summary: Virtual machine provisioner for the Test Management Tool
 Obsoletes: tmt-testcloud < 0.17
 Requires: tmt == %{version}-%{release}
-Requires: python%{python3_pkgversion}-testcloud >= 0.6.1
-Requires: ansible openssh-clients
+Requires: python%{python3_pkgversion}-testcloud >= 0.8.1
+Requires: openssh-clients
+Requires: (ansible or ansible-core)
+# Recommend qemu system emulators for supported arches
+%if 0%{?fedora}
+Recommends: qemu-system-aarch64-core
+Recommends: qemu-system-ppc-core
+Recommends: qemu-system-s390x-core
+Recommends: qemu-system-x86-core
+%endif
 
 %description provision-virtual
 Dependencies required to run tests in a local virtual machine.
 
 %package test-convert
 Summary: Test import and export dependencies
+Requires: tmt == %{version}-%{release}
 Requires: make python3-nitrate python3-html2text python3-markdown
 Requires: python3-bugzilla
 
@@ -73,6 +96,7 @@ Additional dependencies needed for test metadata import and export.
 
 %package report-html
 Summary: Report plugin with support for generating web pages
+Requires: tmt == %{version}-%{release}
 Requires: python3-jinja2
 
 %description report-html
@@ -81,6 +105,7 @@ output thanks to direct links to output logs.
 
 %package report-junit
 Summary: Report plugin with support for generating JUnit output file
+Requires: tmt == %{version}-%{release}
 Requires: python3-junit_xml
 
 %description report-junit
@@ -115,7 +140,8 @@ mkdir -p %{buildroot}%{_mandir}/man1
 mkdir -p %{buildroot}/etc/bash_completion.d/
 install -pm 644 tmt.1* %{buildroot}%{_mandir}/man1
 install -pm 644 bin/complete %{buildroot}/etc/bash_completion.d/tmt
-
+mkdir -p %{buildroot}%{workdir_root}
+chmod 1777 %{buildroot}%{workdir_root}
 
 %check
 %{__python3} -m pytest -vv -m 'not web' --ignore=tests/integration
@@ -135,8 +161,9 @@ install -pm 644 bin/complete %{buildroot}/etc/bash_completion.d/tmt
 %{python3_sitelib}/%{name}/
 %{python3_sitelib}/%{name}-*.egg-info/
 %license LICENSE
+%dir %{workdir_root}
 %exclude %{python3_sitelib}/%{name}/steps/provision/{,__pycache__/}{podman,testcloud}.*
-%exclude %{python3_sitelib}/%{name}/steps/report/{,__pycache__/}html.*
+%exclude %{python3_sitelib}/%{name}/steps/report/{,__pycache__/}html*
 %exclude %{python3_sitelib}/%{name}/steps/report/{,__pycache__/}junit.*
 
 %files provision-container
@@ -146,7 +173,8 @@ install -pm 644 bin/complete %{buildroot}/etc/bash_completion.d/tmt
 %{python3_sitelib}/%{name}/steps/provision/{,__pycache__/}testcloud.*
 
 %files report-html
-%{python3_sitelib}/%{name}/steps/report/{,__pycache__/}html.*
+%{python3_sitelib}/%{name}/steps/report/{,__pycache__/}html*
+
 
 %files report-junit
 %{python3_sitelib}/%{name}/steps/report/{,__pycache__/}junit.*
@@ -159,6 +187,201 @@ install -pm 644 bin/complete %{buildroot}/etc/bash_completion.d/tmt
 
 
 %changelog
+* Sat Jul 02 2022 Lukáš Zachar <lzachar@redhat.com> - 1.15.0-1
+- Require fresh testcloud with coreos support
+- Bad substitution in tmt-reboot
+- Ignore "certificate verify failed" error when handling retries
+- Cache content of each loaded environment file
+- Initial polarion support for test export
+- Fixes names of Artemis API versions
+- Convert FmfIdType from TypedDict to a dataclass
+- Add CoreOS support to the testcloud provision
+- Run containers with root user
+- Retry getting environment file
+- Test import --general is default now
+- Add typing for steps/finish/shell.py
+- Enhance tmt.utils.retry_session with timeout support
+- Adjust the `rpm-ostree` install implementation
+- Add support for the `rpm-ostree` package manager
+- Add `environment-file` to possible Plan keys
+- Avoid Library url conflict if repo doesn't exist
+- Check changes are pushed before export nitrate
+- Add typing for beakerlib.py
+- Unbundle template from the report.html plugin
+- Rename `uuid` to `identifier` to prevent conflicts
+- Use `must` for all mandatory spec requirements
+- Fail import for packages starting with minus sign
+- Adds support for newer Artemis API versions
+- Disable the extra verbose progress in testcloud
+- Refactor internal executor scripts
+- Adds "missing" imports to help IDEs follow objects
+- Add typing for steps/__init__.py
+- Implement the test `result` attribute
+- Add typing for plugins/__init__.py
+- Detect legacy relevancy during import as well
+- Implement the new user story key `priority`
+- Implement new class `SerializableContainer`
+- Add schema for stories
+- Add typing for steps/prepare/shell.py
+- Add typing for steps/prepare/ansible.py
+- Require fmf >= 1.1.0 (we need validation support)
+- Package fmf root into the source tarball as well
+- Add JSON Schema for tests
+- Exclude namespaced backup in beakerlib
+- Use --depth=1 when cloning git repos by default
+- Handle missing nitrate user during export
+- Removes unused GuestContainer.container_id attribute
+- Every subpackage must require the main tmt package
+- Introduce dataclasses as a requirement
+- Avoid re-using image/instance for different values by testcloud plugin
+- Add typing for multihost.py
+- Except nitrate xmlrpc issues during import
+- Exclude beakerlib's backup dir from guest.pull()
+- Increase `duration` for the reboot-related tests
+- Several release-related tests and docs adjustments
+
+* Mon Jun 06 2022 Petr Šplíchal <psplicha@redhat.com> - 1.14.0-1
+- Command 'tmt clean' should not run rsync at all
+- Dist-git-source for Discover (fmf, shell)
+- Adjust the new `id` key implementation
+- Add a new core key `id` for unique identifiers
+- Recommend qemu emulators for other architectures
+- Copy the whole git repo only if necessary
+- Reveal hidden errors during `testcloud` booting
+- Use time for timeout handling in Guest.reconnect()
+- Split `Guest` class to separate SSH-capable guests
+- Explicitly set the docs language in the config
+- Kill the running test when rebooting
+- Extend the reboot timeout to allow system upgrades
+- Allow selecting tasks directly from upgrade config
+- Adjust the new `upgrade` execute plugin
+- Allow specifying command for reboot
+- Implement upgrade execute plugin
+- Buildrequire python3-docutils, append plan adjust
+- Implement `tmt tests export --nitrate --link-runs`
+- Detect component from general plan during import
+- Adjust the support for steps in standalone mode
+- Add results method to ExecutePlugin
+- Implement a common ancestor for Action and Plugin
+- Allow abstractly excluding steps from runs
+- Correctly handle tests --name '.' shortcut
+- Rename WorkdirType to WorkdirArgumentType
+- Fix workdir parameter type for tmt.utils.Common
+- Allows importing jira issues as link-relates
+- Enables mypy coverage for empty-ish Python files
+- Adds type annotations to tmt.templates
+- Prevent infinite recursion if --id is set
+- Enable mypy check for Artemis provision plugin
+- Adjust provision dry mode propagation, add a test
+- Introduce new _options attribute to Common class
+- Add specification for remote plans referencing
+- Bootstrap type annotations
+- Execute script should not be used with discover
+- Add the `arch` key to the hardware specification
+- Fix pip install instructions
+- Disable network access when building in copr
+- Ignore list for dist-git-source
+- Remove the obsoleted `detach` execute method
+- Fix login during `execute` and `prepare` step
+- Import from Makefile with missing build target
+
+* Mon May 02 2022 Petr Šplíchal <psplicha@redhat.com> - 1.13.0-1
+- Add multiarch support to testcloud provision
+- Consistent summary for test export --nitrate
+- Allow dry mode for tests export --nitrate
+- Add a nice provisioning progress to Artemis plugin
+- Add support for the `where` keyword to `execute`
+- Adjust support for export of multiple tests
+- Add support for exporting multiple tests
+- Basic multihost test for the httpd web server
+- Update multihost specification with guest groups
+- Add a provision plugin for Artemis
+- Fix exclude option in fmf discover
+- Reduce the number of execute calls for reboot
+- Add support for reboot in interactive mode
+
+* Mon Apr 04 2022 Petr Šplíchal <psplicha@redhat.com> - 1.12.0-1
+- Add a command to setup shell completions
+- Use /tmp instead of /run/user/ if not available
+- Use separate examples in the test specification
+- Add more story examples, simplify examples export
+- Story.example can hold list of strings
+- Fix traceback when connect plugin is used without hostname.
+- Adjust disabled shell expansion in Common.run()
+- Disable shell expansion in Common.run() by default
+- Build `epel9` packages, update install docs
+- Adjust the full test wrapper and document it
+- Test which compiles tmt and runs its testsuite
+- Add --exclude search option
+- Correct regex for require read from metadata file
+- Update document for creating virtual environment
+- Option to export fmf-id from run discover -h fmf
+- Allow import from restraint's metadata file (#1043)
+- Do not disable building for power arch on Fedora
+- Update documentation for plan parametrization
+- Make .vscode ignored by git
+- Drops basestring and unicode built-ins from utils
+- Fix timeout behaviour in testcloud plugin
+- Fixes possible test of None-ish CWD when running a command
+- Remove workdir only when its defined
+- Adjust the new `tmt plan export` feature
+- New feature: tmt plan export
+
+* Wed Mar 02 2022 Petr Šplíchal <psplicha@redhat.com> - 1.11.0-1
+- Prevent koji build failures on unsupported arches
+- Check remote git URL if it is accessible
+- Implement a generic `requires` for all plugins
+- Run commands in podman provision via bash
+- Adjust implementation of the new `order` attribute
+- Implement the Core attribute `order`
+- Fix link generation in report.html
+- Improve step name handling
+- Enable shared volume mounts in podman provision
+- Add support for multihost provision and prepare
+- Adjust the dnf support for rsync install
+- Add dnf support for rsync install
+- Update links and refs after migration to `teemtee`
+- Track output for reboot purposes on per-test basis
+- Fix test --name '.' used with multiple plans
+- Tweak test suite (duration, centos:8, datadir)
+- Use `os.pathsep` to separate `TMT_PLUGINS` paths (#1049)
+- Document framework:shell exit codes
+- Add `html2text` to the `convert` pip dependencies
+
+* Tue Feb 01 2022 Lukáš Zachar <lzachar@redhat.com> - 1.10.0-1
+- Make reboot support a bit more backward compatible
+- Ensure that workdir has a correct selinux context
+- Use `centos:stream8` image instead of `centos:8`
+- Disable X11 forwarding in ssh connections
+- Fix traceback for login after last report
+- Use `TMT_TEST_DATA` as location for `rlFileSubmit`
+- Implement variables for storing logs and artifacts
+- Adjust rsync installation on read-only distros
+- Handle rsync installation on read-only distros
+- Add hardware specification for hostname
+- Correctly import multiple bugs from Makefile
+- Remove dependency on the `python3-mock` package
+- Adjust linting of manual test files
+- Check Markdown files in tmt lint if `manual=True`
+- Adjust pulling logs from the guest during finish
+- Add guest.pull() to the finish step
+- Update virtualization hints for session connection
+- Improve error message for empty git repositories
+- Minor modification of test result specification
+- Use `where` instead of `on` in the multihost spec
+- Clarify that `path` is defined from the tree root
+- Adjust ansible requires for containers preparation
+- Move the reboot scripts to a read/write directory
+- Ignore read/only file systems reboot script errors
+- Require either ansible or ansible-core
+- Set the `TMT_TREE` variable during test execution
+- Clarify that 'until' means until and including
+- Update test debugging examples with --force option
+- Add `bios.method` to hardware spec
+- Improve environment variables specification a bit
+- Adjust the ssh connection multiplexing
+- Add support for ssh multiplexing
+
 * Tue Nov 30 2021 Petr Šplíchal <psplicha@redhat.com> - 1.9.0-1
 - Improve testcloud/virtual provider docs
 - Disable UseDNS, GSSAPI for faster SSH in testcloud

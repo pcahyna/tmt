@@ -13,36 +13,36 @@ execute:
             /path:
                 discover:
                     how: fmf
-                    url: https://github.com/psss/tmt
+                    url: https://github.com/teemtee/tmt
                     ref: eae4d52
                     path: /examples/together
             /nopath:
                 discover:
                     how: fmf
-                    url: https://github.com/psss/tmt
+                    url: https://github.com/teemtee/tmt
                     ref: 5407fe5
         /noref:
             /path:
                 discover:
                     how: fmf
-                    url: https://github.com/psss/tmt
+                    url: https://github.com/teemtee/tmt
                     path: /examples/together
 
             /nopath:
                 discover:
                     how: fmf
-                    url: https://github.com/psss/tmt
+                    url: https://github.com/teemtee/tmt
         /parametrize:
             /environment:
                 environment:
                     REPO: tmt
                 discover:
                     how: fmf
-                    url: https://github.com/psss/$REPO
+                    url: https://github.com/teemtee/$REPO
             /noenvironment:
                 discover:
                     how: fmf
-                    url: https://github.com/psss/${REPO}
+                    url: https://github.com/teemtee/${REPO}
     /nourl:
         /ref:
             /path:
@@ -74,11 +74,16 @@ execute:
         summary: Integer reference
         discover:
             how: fmf
-            ref: 5788736
+            ref: 21962777
 
     /distgit:
         summary: Extract distgit sources
         discover:
             how: fmf
             dist-git-source: true
+            dist-git-init: false
             test: tests/prepare/install$
+    /exclude:
+        discover:
+            how: fmf
+            exclude: /tests/discover1

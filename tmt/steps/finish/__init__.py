@@ -1,10 +1,13 @@
 import copy
-import re
+from typing import Optional, Type
 
 import click
 import fmf
 
 import tmt
+import tmt.steps
+from tmt.steps import Action
+from tmt.utils import GeneralError
 
 
 class Finish(tmt.steps.Step):
@@ -30,7 +33,7 @@ class Finish(tmt.steps.Step):
             plugin.wake()
             # Add plugin only if there are data
             if len(plugin.data.keys()) > 2:
-                self._plugins.append(plugin)
+                self._phases.append(plugin)
 
         # Nothing more to do if already done
         if self.status() == 'done':
@@ -48,7 +51,7 @@ class Finish(tmt.steps.Step):
 
     def summary(self):
         """ Give a concise summary """
-        tasks = fmf.utils.listed(self.plugins(), 'task')
+        tasks = fmf.utils.listed(self.phases(), 'task')
         self.info('summary', f'{tasks} completed', 'green', shift=1)
 
     def go(self):
@@ -69,8 +72,20 @@ class Finish(tmt.steps.Step):
             # finish step config rather than provision step config.
             guest_copy = copy.copy(guest)
             guest_copy.parent = self
-            for plugin in self.plugins():
-                plugin.go(guest_copy)
+            for phase in self.phases(classes=(Action, FinishPlugin)):
+                if isinstance(phase, Action):
+                    phase.go()
+
+                elif isinstance(phase, FinishPlugin):
+                    phase.go(guest_copy)
+
+                else:
+                    raise GeneralError(f'Unexpected phase in finish step: {phase}')
+
+            # Pull artifacts created in the plan data directory
+            # if there was at least one plugin executed
+            if self.phases():
+                guest_copy.pull(self.plan.data_directory)
 
         # Stop and remove provisioned guests
         for guest in self.plan.provision.guests():
@@ -82,6 +97,19 @@ class Finish(tmt.steps.Step):
         self.status('done')
         self.save()
 
+    def requires(self):
+        """
+        Packages required by all enabled finish plugins
+
+        Return a list of packages which need to be installed on the
+        provisioned guest so that the finishing tasks work well.
+        Used by the prepare step.
+        """
+        requires = set()
+        for plugin in self.phases(classes=FinishPlugin):
+            requires.update(plugin.requires())
+        return list(requires)
+
 
 class FinishPlugin(tmt.steps.Plugin):
     """ Common parent of finish plugins """
@@ -90,7 +118,10 @@ class FinishPlugin(tmt.steps.Plugin):
     _supported_methods = []
 
     @classmethod
-    def base_command(cls, method_class=None, usage=None):
+    def base_command(
+            cls,
+            usage: str,
+            method_class: Optional[Type[click.Command]] = None) -> click.Command:
         """ Create base click command (common for all finish plugins) """
 
         # Prepare general usage message for the step

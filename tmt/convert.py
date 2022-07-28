@@ -8,31 +8,51 @@ import pprint
 import re
 import subprocess
 from io import open
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
 
 import fmf.utils
 from click import echo, style
 
+import tmt.export
 import tmt.utils
-from tmt.utils import ConvertError
+from tmt.utils import ConvertError, GeneralError
 
 log = fmf.utils.Logging('tmt').logger
 
+# It is not possible to use TypedDict here, because all keys are unknown
+NitrateDataType = Dict[str, Any]
+
+if TYPE_CHECKING:
+    from nitrate import TestCase
+
 
 # Test case relevancy regular expressions
+RELEVANCY_LEGACY_HEADER = r"relevancy:\s*$(.*)"
 RELEVANCY_COMMENT = r"^([^#]*?)\s*#\s*(.+)$"
 RELEVANCY_RULE = r"^([^:]+)\s*:\s*(.+)$"
 RELEVANCY_EXPRESSION = (
     r"^\s*(.*?)\s*(!?contains|!?defined|[=<>!]+)\s*(.*?)\s*$")
+GENERAL_PLAN = r"(\S+?)\s*/\s*General"
 
-# Bug url prefix
+# Bug url prefixes
 BUGZILLA_URL = 'https://bugzilla.redhat.com/show_bug.cgi?id='
+JIRA_URL = 'https://issues.redhat.com/browse/'
+
+# Bug system constants
+SYSTEM_BUGZILLA = 1
+SYSTEM_JIRA = 2
+SYSTEM_OTHER = 42
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #  Convert
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-def read_manual(plan_id, case_id, disabled, with_script):
+def read_manual(
+        plan_id: int,
+        case_id: int,
+        disabled: bool,
+        with_script: bool) -> None:
     """
     Reads metadata of manual test cases from Nitrate
     """
@@ -47,10 +67,10 @@ def read_manual(plan_id, case_id, disabled, with_script):
 
     try:
         if plan_id:
-            all_cases = nitrate.TestPlan(int(plan_id)).testcases
+            all_cases = nitrate.TestPlan(plan_id).testcases
             case_ids = [case.id for case in all_cases if not case.automated]
         else:
-            case_ids = [int(case_id)]
+            case_ids = [case_id]
     except ValueError:
         raise ConvertError('Test plan/case identifier must be an integer.')
 
@@ -100,7 +120,7 @@ def read_manual(plan_id, case_id, disabled, with_script):
     os.chdir(old_cwd)
 
 
-def read_manual_data(testcase):
+def read_manual_data(testcase: 'TestCase') -> Dict[str, str]:
     """ Read test data from manual fields """
     md_content = {}
     md_content['setup'] = html_to_markdown(testcase.setup)
@@ -110,7 +130,7 @@ def read_manual_data(testcase):
     return md_content
 
 
-def html_to_markdown(html):
+def html_to_markdown(html: str) -> str:
     """ Convert html to markdown """
     try:
         import html2text
@@ -121,11 +141,11 @@ def html_to_markdown(html):
     if html is None:
         markdown = ""
     else:
-        markdown = md_handler.handle(html).strip()
+        markdown = cast(str, md_handler.handle(html)).strip()
     return markdown
 
 
-def write_markdown(path, content):
+def write_markdown(path: str, content: Dict[str, str]) -> None:
     """ Write gathered metadata in the markdown format """
     to_print = ""
     if content['setup']:
@@ -148,9 +168,17 @@ def write_markdown(path, content):
         raise ConvertError(f"Unable to write '{path}'.")
 
 
-def add_bug(bug, data):
-    """ Add relevant bug into data under the 'link' key """
-    new_link = dict(relates=f"{BUGZILLA_URL}{bug}")
+def add_link(target: str, data: NitrateDataType,
+             system: int = SYSTEM_BUGZILLA, type_: str = 'relates') -> None:
+    """ Add relevant link into data under the 'link' key """
+    new_link = dict()
+    if system == SYSTEM_BUGZILLA:
+        new_link[type_] = f"{BUGZILLA_URL}{target}"
+    elif system == SYSTEM_JIRA:
+        new_link[type_] = f"{JIRA_URL}{target}"
+    elif system == SYSTEM_OTHER:
+        new_link[type_] = target
+
     try:
         # Make sure there are no duplicates
         if new_link in data['link']:
@@ -158,136 +186,101 @@ def add_bug(bug, data):
         data['link'].append(new_link)
     except KeyError:
         data['link'] = [new_link]
-    echo(style('relates: ', fg='green') + new_link['relates'])
+    echo(style(f'{type_}: ', fg='green') + new_link[type_])
 
 
-def read(path, makefile, nitrate, purpose, disabled, types):
+def read_datafile(
+        path: str,
+        filename: str,
+        datafile: str,
+        types: List[str],
+        testinfo: Optional[str] = None
+        ) -> Tuple[str, NitrateDataType]:
     """
-    Read old metadata from various sources
-
-    Returns tuple (common_data, individual_data) where 'common_data' are
-    metadata which belong to main.fmf and 'individual_data' contains
-    data for individual testcases (if multiple nitrate testcases found).
+    Read data values from supplied Makefile or metadata file.
+    Returns task name and a dictionary of the collected values.
     """
 
-    data = dict()
-    echo("Checking the '{0}' directory.".format(path))
+    data: NitrateDataType = dict()
+    if filename == 'Makefile':
+        regex_task = r'Name:\s*(.*)\n'
+        regex_summary = r'^Description:\s*(.*)\n'
+        regex_test = r'^run:.*\n\t(.*)$'
+        regex_contact = r'^Owner:\s*(.*)'
+        regex_duration = r'^TestTime:\s*(.*)'
+        regex_recommend = r'^Requires:\s*(.*)'
+        regex_require = r'^RhtsRequires:\s*(.*)'
+        rec_separator = None
+    else:
+        regex_task = r'name=\s*(.*)\n'
+        regex_summary = r'description=\s*(.*)\n'
+        regex_test = r'entry_point=\s*(.*)$'
+        regex_contact = r'owner=\s*(.*)'
+        regex_duration = r'max_time=\s*(.*)'
+        regex_require = r'dependencies=\s*(.*)'
+        regex_recommend = r'softDependencies=\s*(.*)'
+        rec_separator = ';'
 
-    # Make sure there is a metadata tree initialized
+    if testinfo is None:
+        testinfo = datafile
+
+    # Beaker task name
+    search_result = re.search(regex_task, testinfo)
+    if search_result is None:
+        raise ConvertError("Unable to parse 'Name' from testinfo.desc.")
+    beaker_task = search_result.group(1)
+    echo(style('task: ', fg='green') + beaker_task)
+    data['extra-task'] = beaker_task
+    data['extra-summary'] = beaker_task
+
+    # Summary
+    search_result = re.search(regex_summary, testinfo, re.M)
+    if search_result is not None:
+        data['summary'] = search_result.group(1)
+        echo(style('summary: ', fg='green') + data['summary'])
+
+    # Test script
+    search_result = re.search(regex_test, datafile, re.M)
+    if search_result is None:
+        raise ConvertError("Makefile is missing the 'run' target.")
+    data['test'] = search_result.group(1)
+    if filename == 'metadata':
+        data['test'] = data['test'].split()[-1]
+    echo(style('test: ', fg='green') + data['test'])
+
+    # Detect framework
     try:
-        tree = fmf.Tree(path)
-    except fmf.utils.RootError:
-        raise ConvertError("Initialize metadata tree using 'tmt init'.")
+        test_path = os.path.join(path, data["test"])
+        with open(test_path, encoding="utf-8") as test_file:
+            if re.search("beakerlib", test_file.read()):
+                data["framework"] = "beakerlib"
+            else:
+                data["framework"] = "shell"
+        echo(style("framework: ", fg="green") + data["framework"])
+    except IOError:
+        raise ConvertError("Unable to open '{0}'.".format(test_path))
 
-    # Makefile (extract summary, test, duration and requires)
-    if makefile:
-        echo(style('Makefile ', fg='blue'), nl=False)
-        makefile_path = os.path.join(path, 'Makefile')
-        try:
-            with open(makefile_path, encoding='utf-8') as makefile_file:
-                makefile = makefile_file.read()
-        except IOError:
-            raise ConvertError("Unable to open '{0}'.".format(makefile_path))
-        echo("found in '{0}'.".format(makefile_path))
+    # Contact
+    search_result = re.search(regex_contact, testinfo, re.M)
+    if search_result is not None:
+        data['contact'] = search_result.group(1)
+        echo(style('contact: ', fg='green') + data['contact'])
 
-        # If testinfo.desc exists read it to preserve content and remove it
-        testinfo_path = os.path.join(path, 'testinfo.desc')
-        if os.path.isfile(testinfo_path):
-            try:
-                with open(testinfo_path, encoding='utf-8') as testinfo:
-                    old_testinfo = testinfo.read()
-                    os.remove(testinfo_path)
-            except IOError:
-                raise ConvertError(
-                    "Unable to open '{0}'.".format(testinfo_path))
-        else:
-            old_testinfo = None
-
-        # Make Makefile 'makeable' without extra dependecies
-        # (replace targets, make include optional and remove rhts-lint)
-        makefile = makefile.replace('$(METADATA)', 'testinfo.desc')
-        makefile = re.sub(
-            r'^include /usr/share/rhts/lib/rhts-make.include',
-            '-include /usr/share/rhts/lib/rhts-make.include',
-            makefile, flags=re.MULTILINE)
-        makefile = re.sub('.*rhts-lint.*', '', makefile)
-
-        # Create testinfo.desc file with resolved variables
-        try:
-            process = subprocess.run(
-                ["make", "testinfo.desc", "-C", path, "-f", "-"],
-                input=makefile, check=True, encoding='utf-8',
-                stdout=subprocess.DEVNULL)
-        except FileNotFoundError:
-            raise ConvertError(
-                "Install tmt-test-convert to convert metadata from Makefile.")
-        except subprocess.CalledProcessError:
-            raise ConvertError(
-                "Failed to convert metadata using 'make testinfo.desc'.")
-
-        # Read testinfo.desc
-        try:
-            with open(testinfo_path, encoding='utf-8') as testinfo_file:
-                testinfo = testinfo_file.read()
-        except IOError:
-            raise ConvertError("Unable to open '{0}'.".format(testinfo_path))
-
-        # Beaker task name
-        try:
-            beaker_task = re.search(r'Name:\s*(.*)\n', testinfo).group(1)
-            echo(style('task: ', fg='green') + beaker_task)
-            data['extra-task'] = beaker_task
-            data['extra-summary'] = beaker_task
-        except AttributeError:
-            raise ConvertError("Unable to parse 'Name' from testinfo.desc.")
-        # Summary
-        try:
-            data['summary'] = re.search(
-                r'^Description:\s*(.*)\n', testinfo, re.M).group(1)
-            echo(style('summary: ', fg='green') + data['summary'])
-        except AttributeError:
-            pass
-        # Test script
-        try:
-            data['test'] = re.search(
-                r'^run:.*\n\t(.*)$', makefile, re.M).group(1)
-            echo(style('test: ', fg='green') + data['test'])
-        except AttributeError:
-            raise ConvertError("Makefile is missing the 'run' target.")
-        # Detect framework
-        try:
-            test_path = os.path.join(path, data["test"])
-            with open(test_path, encoding="utf-8") as test_file:
-                if re.search("beakerlib", test_file.read()):
-                    data["framework"] = "beakerlib"
-                else:
-                    data["framework"] = "shell"
-            echo(style("framework: ", fg="green") + data["framework"])
-        except IOError:
-            raise ConvertError("Unable to open '{0}'.".format(test_path))
-
-        # Contact
-        try:
-            data['contact'] = re.search(
-                r'^Owner:\s*(.*)', testinfo, re.M).group(1)
-            echo(style('contact: ', fg='green') + data['contact'])
-        except AttributeError:
-            pass
+    if filename == 'Makefile':
         # Component
-        try:
-            data['component'] = re.search(
-                r'^RunFor:\s*(.*)', testinfo, re.M).group(1).split()
+        search_result = re.search(r'^RunFor:\s*(.*)', testinfo, re.M)
+        if search_result is not None:
+            data['component'] = search_result.group(1).split()
             echo(style('component: ', fg='green') +
                  ' '.join(data['component']))
-        except AttributeError:
-            pass
-        # Duration
-        try:
-            data['duration'] = re.search(
-                r'^TestTime:\s*(.*)', testinfo, re.M).group(1)
-            echo(style('duration: ', fg='green') + data['duration'])
-        except AttributeError:
-            pass
+
+    # Duration
+    search_result = re.search(regex_duration, testinfo, re.M)
+    if search_result is not None:
+        data['duration'] = search_result.group(1)
+        echo(style('duration: ', fg='green') + data['duration'])
+
+    if filename == 'Makefile':
         # Environment
         variables = re.findall(r'^Environment:\s*(.*)', testinfo, re.M)
         if variables:
@@ -297,25 +290,41 @@ def read(path, makefile, nitrate, purpose, disabled, types):
                 data['environment'][key] = value
             echo(style('environment:', fg='green'))
             echo(pprint.pformat(data['environment']))
-        # RhtsRequires (optional) goes to require
-        requires = re.findall(r'^RhtsRequires:\s*(.*)', testinfo, re.M)
-        if requires:
-            data['require'] = [
-                require for line in requires for require in line.split()]
-            echo(style('require: ', fg='green') + ' '.join(data['require']))
 
-        # Requires (optional) goes to recommend
-        recommends = re.findall(r'^Requires:\s*(.*)', testinfo, re.M)
-        if recommends:
-            data['recommend'] = [
-                recommend for line in recommends for recommend in line.split()]
-            echo(
-                style('recommend: ', fg='green') + ' '.join(data['recommend']))
+    def sanitize_name(name: str) -> str:
+        """ Raise if package name starts with '-' (negative require) """
+        if name.startswith('-'):
+            # Beaker supports excluding packages but tmt does not
+            # https://github.com/teemtee/tmt/issues/1165#issuecomment-1122293224
+            raise ConvertError(
+                "Excluding packages is not supported by tmt require/recommend. "
+                "Plan can take care of such situation in Prepare step, "
+                "but cannot be created automatically. "
+                f"(Found '{name}' during conversion).")
+        return name
 
+    # RhtsRequires or repoRequires (optional) goes to require
+    requires = re.findall(regex_require, testinfo, re.M)
+    if requires:
+        data['require'] = [
+            sanitize_name(require) for line in requires
+            for require in line.split(rec_separator)]
+        echo(style('require: ', fg='green') + ' '.join(data['require']))
+
+    # Requires or softDependencies (optional) goes to recommend
+    recommends = re.findall(regex_recommend, testinfo, re.M)
+    if recommends:
+        data['recommend'] = [
+            sanitize_name(recommend) for line in recommends
+            for recommend in line.split(rec_separator)]
+        echo(
+            style('recommend: ', fg='green') + ' '.join(data['recommend']))
+
+    if filename == 'Makefile':
         # Convert Type into tags
-        try:
-            makefile_type = re.search(
-                r'^Type:\s*(.*)', testinfo, re.M).group(1)
+        search_result = re.search(r'^Type:\s*(.*)', testinfo, re.M)
+        if search_result is not None:
+            makefile_type = search_result.group(1)
             if 'all' in [type_.lower() for type_ in types]:
                 tags = makefile_type.split()
             else:
@@ -324,24 +333,169 @@ def read(path, makefile, nitrate, purpose, disabled, types):
             if tags:
                 echo(style("tag: ", fg="green") + " ".join(tags))
                 data["tag"] = tags
-        except AttributeError:
-            pass
         # Add relevant bugs to the 'link' attribute
-        for bug in re.findall(r'^Bug:\s*([0-9]+)', testinfo, re.M):
-            add_bug(bug, data)
+        for bug_line in re.findall(r'^Bug:\s*([0-9\s]+)', testinfo, re.M):
+            for bug in re.findall(r'(\d+)', bug_line):
+                add_link(bug, data, SYSTEM_BUGZILLA)
+
+    return beaker_task, data
+
+
+ReadOutputType = Tuple[NitrateDataType, List[NitrateDataType]]
+
+
+def read(
+        path: str,
+        makefile: bool,
+        restraint: bool,
+        nitrate: bool,
+        purpose: bool,
+        disabled: bool,
+        types: List[str],
+        general: bool
+        ) -> ReadOutputType:
+    """
+    Read old metadata from various sources
+
+    Returns tuple (common_data, individual_data) where 'common_data' are
+    metadata which belong to main.fmf and 'individual_data' contains
+    data for individual testcases (if multiple nitrate testcases found).
+    """
+
+    echo("Checking the '{0}' directory.".format(path))
+
+    # Make sure there is a metadata tree initialized
+    try:
+        tree = fmf.Tree(path)
+    except fmf.utils.RootError:
+        raise ConvertError("Initialize metadata tree using 'tmt init'.")
+
+    # Ascertain if datafile is of type Makefile or metadata
+    makefile_file = None
+    restraint_file = None
+    filename = None
+
+    files = \
+        [f for f in os.listdir(path)
+         if os.path.isfile(os.path.join(path, f))]
+
+    # Ascertain which file to use based on cmd arg.
+    # If both are false raise an assertion.
+    # If both are true then default to using
+    # the restraint metadata file.
+    # Raise an assertion if the file is not found.
+    if not makefile and not restraint:
+        raise ConvertError("Please specify either a "
+                           "Makefile or Restraint file.")
+    elif makefile and restraint:
+        if 'metadata' in files:
+            filename = 'metadata'
+            restraint_file = True
+            echo(style('Restraint file ', fg='blue'), nl=False)
+        elif 'Makefile' in files:
+            filename = 'Makefile'
+            makefile_file = True
+            echo(style('Makefile ', fg='blue'), nl=False)
+        else:
+            raise ConvertError("Unable to find any metadata file.")
+    elif makefile:
+        if 'Makefile' not in files:
+            raise ConvertError("Unable to find Makefile")
+        else:
+            filename = 'Makefile'
+            makefile_file = True
+            echo(style('Makefile ', fg='blue'), nl=False)
+    elif restraint:
+        if 'metadata' not in files:
+            raise ConvertError("Unable to find restraint metadata file")
+        else:
+            filename = 'metadata'
+            restraint_file = True
+            echo(style('Restraint ', fg='blue'), nl=False)
+
+    if filename is None:
+        raise GeneralError('filename is not defined')
+    # Open the datafile
+    if restraint_file or makefile_file:
+        datafile_path = os.path.join(path, filename)
+        try:
+            with open(datafile_path, encoding='utf-8') as datafile_file:
+                datafile = datafile_file.read()
+        except IOError:
+            raise ConvertError("Unable to open '{0}'.".format(
+                datafile_path))
+        echo("found in '{0}'.".format(datafile_path))
+
+    # If testinfo.desc exists read it to preserve content and remove it
+    testinfo_path = os.path.join(path, 'testinfo.desc')
+    if os.path.isfile(testinfo_path):
+        try:
+            with open(testinfo_path, encoding='utf-8') as testinfo_file:
+                old_testinfo = testinfo_file.read()
+                os.remove(testinfo_path)
+        except IOError:
+            raise ConvertError(
+                "Unable to open '{0}'.".format(testinfo_path))
+    else:
+        old_testinfo = None
+
+    # Make Makefile 'makeable' without extra dependecies
+    # (replace targets, make include optional and remove rhts-lint)
+    if makefile_file:
+        datafile = datafile.replace('$(METADATA)', 'testinfo.desc')
+        datafile = re.sub(
+            r'^include /usr/share/rhts/lib/rhts-make.include',
+            '-include /usr/share/rhts/lib/rhts-make.include',
+            datafile, flags=re.MULTILINE)
+        datafile = re.sub('.*rhts-lint.*', '', datafile)
+        # Create testinfo.desc file with resolved variables
+        try:
+            subprocess.run(
+                ["make", "testinfo.desc", "-C", path, "-f", "-"],
+                input=datafile, check=True, encoding='utf-8',
+                stdout=subprocess.DEVNULL)
+        except FileNotFoundError:
+            raise ConvertError(
+                "Install tmt-test-convert to "
+                "convert metadata from {0}.".format(filename))
+        except subprocess.CalledProcessError:
+            raise ConvertError(
+                "Failed to convert metadata using 'make testinfo.desc'.")
+
+        # Read testinfo.desc
+        try:
+            with open(testinfo_path, encoding='utf-8') as testinfo_file:
+                testinfo = testinfo_file.read()
+        except IOError:
+            raise ConvertError("Unable to open '{0}'.".format(
+                testinfo_path))
+
+    # restraint
+    if restraint_file:
+        beaker_task, data = \
+            read_datafile(path, filename, datafile, types)
+
+    # Makefile (extract summary, test, duration and requires)
+    else:
+        beaker_task, data = \
+            read_datafile(path, filename, datafile, types, testinfo)
 
         # Warn if makefile has extra lines in run and build targets
-        def target_content(target):
+        def target_content(target: str) -> List[str]:
             """ Extract lines from the target content """
             regexp = rf"^{target}:.*\n((?:\t[^\n]*\n?)*)"
-            target = re.search(regexp, makefile, re.M).group(1)
+            search_result = re.search(regexp, datafile, re.M)
+            if search_result is None:
+                # Target not found in the Makefile
+                return []
+            target = search_result.group(1)
             return [line.strip('\t') for line in target.splitlines()]
 
         run_target_list = target_content("run")
         run_target_list.remove(data["test"])
         if run_target_list:
             echo(style(
-                f"warn: Extra lines detected in the 'run' target:",
+                "warn: Extra lines detected in the 'run' target:",
                 fg="yellow"))
             for line in run_target_list:
                 echo(f"    {line}")
@@ -349,7 +503,7 @@ def read(path, makefile, nitrate, purpose, disabled, types):
         build_target_list = target_content("build")
         if len(build_target_list) > 1:
             echo(style(
-                f"warn: Multiple lines detected in the 'build' target:",
+                "warn: Multiple lines detected in the 'build' target:",
                 fg="yellow"))
             for line in build_target_list:
                 echo(f"    {line}")
@@ -357,8 +511,8 @@ def read(path, makefile, nitrate, purpose, disabled, types):
         # Restore the original testinfo.desc content (if existed)
         if old_testinfo:
             try:
-                with open(testinfo_path, 'w', encoding='utf-8') as testinfo:
-                    testinfo.write(old_testinfo)
+                with open(testinfo_path, 'w', encoding='utf-8') as testinfo_file:
+                    testinfo_file.write(old_testinfo)
             except IOError:
                 raise ConvertError(
                     "Unable to write '{0}'.".format(testinfo_path))
@@ -371,8 +525,8 @@ def read(path, makefile, nitrate, purpose, disabled, types):
         echo(style('Purpose ', fg='blue'), nl=False)
         purpose_path = os.path.join(path, 'PURPOSE')
         try:
-            with open(purpose_path, encoding='utf-8') as purpose:
-                content = purpose.read()
+            with open(purpose_path, encoding='utf-8') as purpose_file:
+                content = purpose_file.read()
             echo("found in '{0}'.".format(purpose_path))
             for header in ['PURPOSE', 'Description', 'Author']:
                 content = re.sub('^{0}.*\n'.format(header), '', content)
@@ -385,7 +539,7 @@ def read(path, makefile, nitrate, purpose, disabled, types):
     # Nitrate (extract contact, environment and relevancy)
     if nitrate:
         common_data, individual_data = read_nitrate(
-            beaker_task, data, disabled)
+            beaker_task, data, disabled, general)
     else:
         common_data = data
         individual_data = []
@@ -405,7 +559,12 @@ def read(path, makefile, nitrate, purpose, disabled, types):
     return common_data, individual_data
 
 
-def read_nitrate(beaker_task, common_data, disabled):
+def read_nitrate(
+        beaker_task: str,
+        common_data: NitrateDataType,
+        disabled: bool,
+        general: bool
+        ) -> ReadOutputType:
     """ Read old metadata from nitrate test cases """
 
     # Need to import nitrate only when really needed. Otherwise we get
@@ -429,7 +588,9 @@ def read_nitrate(beaker_task, common_data, disabled):
         else:
             testcases = list(nitrate.TestCase.search(
                 script=beaker_task, case_status__in=[1, 2, 4]))
-    except (nitrate.NitrateError, gssapi.raw.misc.GSSError) as error:
+    except (nitrate.NitrateError,
+            nitrate.xmlrpc_driver.NitrateXmlrpcError,
+            gssapi.raw.misc.GSSError) as error:
         raise ConvertError(error)
     if not testcases:
         echo("No {0}testcase found for '{1}'.".format(
@@ -445,7 +606,7 @@ def read_nitrate(beaker_task, common_data, disabled):
         # Testcase data must be fetched due to
         # https://github.com/psss/python-nitrate/issues/24
         testcase._fetch()
-        data = read_nitrate_case(testcase, common_data)
+        data = read_nitrate_case(testcase, common_data, general)
         individual_data.append(data)
         # Check testcase for manual data
         md_content_tmp = read_manual_data(testcase)
@@ -522,9 +683,38 @@ def read_nitrate(beaker_task, common_data, disabled):
     return common_data, individual_data
 
 
-def read_nitrate_case(testcase, makefile_data=None):
+RelevancyType = Union[str, List[str]]
+
+
+def extract_relevancy(
+        notes: str,
+        field: tmt.utils.StructuredField) -> Optional[RelevancyType]:
+    """ Get relevancy from testcase, respecting sf priority """
+    try:
+        if "relevancy" in field:
+            return field.get("relevancy")
+    except tmt.utils.StructuredFieldError:
+        return None
+    # Fallback to the original relevancy syntax
+    # The relevancy definition begins with the header
+    matched = re.search(RELEVANCY_LEGACY_HEADER, notes, re.I + re.M + re.S)
+    if not matched:
+        return None
+    relevancy = matched.groups()[0]
+    # Remove possible additional text after an empty line
+    matched = re.search(r"(.*?)\n\s*\n.*", relevancy, re.S)
+    if matched:
+        relevancy = matched.groups()[0]
+    return relevancy.strip()
+
+
+def read_nitrate_case(
+        testcase: 'TestCase',
+        makefile_data: Optional[NitrateDataType] = None,
+        general: bool = False
+        ) -> NitrateDataType:
     """ Read old metadata from nitrate test case """
-    data = {'tag': []}
+    data: NitrateDataType = {'tag': []}
     echo("test case found '{0}'.".format(testcase.identifier))
     # Test identifier
     data['extra-nitrate'] = testcase.identifier
@@ -539,13 +729,13 @@ def read_nitrate_case(testcase, makefile_data=None):
             data['contact'] = '{} <{}>'.format(
                 testcase.tester.name, testcase.tester.email)
         else:
-            try:
-                # Use contact from Makefile if it's there and email matches
-                if re.search(testcase.tester.email, makefile_data['contact']):
-                    data['contact'] = makefile_data['contact']
-                else:
-                    raise KeyError
-            except (KeyError, TypeError):
+            if makefile_data is None or 'contact' not in makefile_data:
+                # Otherwise use just the email address
+                data['contact'] = testcase.tester.email
+            # Use contact from Makefile if it's there and email matches
+            elif re.search(testcase.tester.email, makefile_data['contact']):
+                data['contact'] = makefile_data['contact']
+            else:
                 # Otherwise use just the email address
                 data['contact'] = testcase.tester.email
         echo(style('contact: ', fg='green') + data['contact'])
@@ -587,8 +777,22 @@ def read_nitrate_case(testcase, makefile_data=None):
         echo(style('tier: ', fg='green') + data['tier'])
     except KeyError:
         pass
-    # Component
-    data['component'] = [comp.name for comp in testcase.components]
+    # Detect components either from general plans
+    if general:
+        data['component'] = []
+        for nitrate_plan in testcase.testplans:
+            if nitrate_plan.type.name == "General":
+                match = re.search(GENERAL_PLAN, nitrate_plan.name)
+                if match:
+                    component = match.group(1)
+                    if component not in data['component']:
+                        echo(
+                            f"Adding component '{component}' "
+                            f"from the linked general plan.")
+                        data['component'].append(component)
+    else:
+        # Or from test case components
+        data['component'] = [comp.name for comp in testcase.components]
     echo(style('component: ', fg='green') + ' '.join(data['component']))
     # Status
     data['enabled'] = testcase.status.name == "CONFIRMED"
@@ -598,22 +802,20 @@ def read_nitrate_case(testcase, makefile_data=None):
         data['manual'] = True
     # Relevancy
     field = tmt.utils.StructuredField(testcase.notes)
-    try:
-        relevancy = field.get('relevancy')
-        if relevancy:
-            data['adjust'] = relevancy_to_adjust(relevancy)
-            echo(style('adjust:', fg='green'))
-            echo(tmt.utils.dict_to_yaml(data['adjust']).strip())
-    except tmt.utils.StructuredFieldError:
-        pass
+    relevancy = extract_relevancy(testcase.notes, field)
+    if relevancy:
+        data['adjust'] = relevancy_to_adjust(relevancy)
+        echo(style('adjust:', fg='green'))
+        echo(tmt.utils.dict_to_yaml(data['adjust']).strip())
 
     # Extend bugs detected from Makefile with those linked in Nitrate
     try:
-        data['link'] = makefile_data['link'].copy()
+        if makefile_data is not None and 'link' in makefile_data:
+            data['link'] = makefile_data['link'].copy()
     except (KeyError, TypeError):
         pass
     for bug in testcase.bugs:
-        add_bug(bug.bug, data)
+        add_link(bug.bug, data, bug.system)
 
     # Header and footer from notes (do not import the warning back)
     data['description'] = re.sub(
@@ -640,7 +842,7 @@ def read_nitrate_case(testcase, makefile_data=None):
     return data
 
 
-def adjust_runtest(path):
+def adjust_runtest(path: str) -> None:
     """ Adjust runtest.sh content and permission """
 
     # Nothing to do if there is no runtest.sh
@@ -681,11 +883,11 @@ def adjust_runtest(path):
             "Could not make '{0}' executable.".format(path))
 
 
-def write(path, data):
+def write(path: str, data: NitrateDataType) -> None:
     """ Write gathered metadata in the fmf format """
     # Put keys into a reasonable order
     extra_keys = [
-        'adjust', 'extra-nitrate',
+        'adjust', 'extra-nitrate', 'extra-polarion',
         'extra-summary', 'extra-task',
         'extra-hardware', 'extra-pepa']
     sorted_data = dict()
@@ -704,7 +906,8 @@ def write(path, data):
         "Metadata successfully stored into '{0}'.".format(path), fg='magenta'))
 
 
-def relevancy_to_adjust(relevancy):
+def relevancy_to_adjust(
+        relevancy: RelevancyType) -> List[NitrateDataType]:
     """
     Convert the old test case relevancy into adjust rules
 
@@ -718,21 +921,20 @@ def relevancy_to_adjust(relevancy):
 
     for line in re.split(r'\s*\n\s*', relevancy.strip()):
         # Extract possible comments
-        try:
-            line, rule['because'] = re.search(RELEVANCY_COMMENT, line).groups()
-        except Exception:
-            pass
+        search_result = re.search(RELEVANCY_COMMENT, line)
+        if search_result is not None:
+            line, rule['because'] = search_result.groups()
 
         # Nothing to do with empty lines
         if not line:
             continue
 
         # Split rule
-        try:
-            condition, decision = re.search(RELEVANCY_RULE, line).groups()
-        except Exception:
+        search_result = re.search(RELEVANCY_RULE, line)
+        if search_result is None:
             raise tmt.utils.ConvertError(
                 f"Invalid test case relevancy rule '{line}'.")
+        condition, decision = search_result.groups()
 
         # Handle the decision
         if decision.lower() == 'false':
@@ -747,12 +949,11 @@ def relevancy_to_adjust(relevancy):
         # Adjust condition syntax
         expressions = list()
         for expression in re.split(r'\s*&&?\s*', condition):
-            try:
-                left, operator, right = re.match(
-                    RELEVANCY_EXPRESSION, expression).groups()
-            except Exception:
+            search_result = re.search(RELEVANCY_EXPRESSION, expression)
+            if search_result is None:
                 raise tmt.utils.ConvertError(
                     f"Invalid test case relevancy expression '{expression}'.")
+            left, operator, right = search_result.groups()
             # Always use double == for equality comparison
             if operator == '=':
                 operator = '=='

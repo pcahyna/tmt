@@ -33,7 +33,6 @@ rlJournalStart
 
     rlPhaseStartTest "Empty environment file"
         rlRun "tmt run -rvvddd discover finish plan -n empty 2>&1 | tee output"
-        rlAssertGrep "environment: {}" "output"
         rlAssertGrep "WARNING.*Empty environment file" "output"
     rlPhaseEnd
 
@@ -50,7 +49,7 @@ rlJournalStart
         # Bad
         rlRun "tmt plan show fetch/bad 2>&1 | tee output" 2
         rlAssertGrep "Failed to fetch the environment file" 'output'
-        rlAssertGrep "Name or service not known" 'output'
+        rlAssertGrep "Not Found" 'output'
     rlPhaseEnd
 
     rlPhaseStartCleanup

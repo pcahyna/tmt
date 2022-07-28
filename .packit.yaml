@@ -19,14 +19,18 @@ jobs:
     targets:
     - fedora-all
     - epel-8
+    - epel-9
+    enable_net: False
 
 - job: copr_build
   trigger: commit
   metadata:
-    branch: master
+    branch: main
     targets:
     - fedora-all
     - epel-8
+    - epel-9
+    enable_net: False
     list_on_homepage: True
     preserve_project: True
     owner: psss

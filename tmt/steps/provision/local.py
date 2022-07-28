@@ -1,4 +1,5 @@
 import tmt
+import tmt.steps.provision
 
 
 class ProvisionLocal(tmt.steps.provision.ProvisionPlugin):
@@ -36,7 +37,10 @@ class ProvisionLocal(tmt.steps.provision.ProvisionPlugin):
         super().go()
 
         # Create a GuestLocal instance
-        data = {'guest': 'localhost'}
+        data = tmt.steps.provision.GuestSshData(
+            guest='localhost',
+            role=self.get('role')
+            )
         self._guest = GuestLocal(data, name=self.name, parent=self.step)
 
     def guest(self):
@@ -51,15 +55,17 @@ class ProvisionLocal(tmt.steps.provision.ProvisionPlugin):
 class GuestLocal(tmt.Guest):
     """ Local Host """
 
+    localhost = True
+
     def ansible(self, playbook, extra_args=None):
         """ Prepare localhost using ansible playbook """
         playbook = self._ansible_playbook_path(playbook)
         stdout, stderr = self.run(
-            f'sudo sh -c "stty cols {tmt.utils.OUTPUT_WIDTH}; '
-            f'{self._export_environment()}ansible-playbook '
-            f'{self._ansible_verbosity()} '
-            f'{self._ansible_extra_args(extra_args)} -c local -i localhost,'
-            f' {playbook}"')
+            ['sudo', '-E', 'ansible-playbook'] +
+            self._ansible_verbosity() +
+            self._ansible_extra_args(extra_args) +
+            ['-c', 'local', '-i', 'localhost,', playbook],
+            env=self._prepare_environment())
         self._ansible_summary(stdout)
 
     def execute(self, command, **kwargs):
@@ -69,15 +75,27 @@ class GuestLocal(tmt.Guest):
         environment.update(kwargs.pop('env', dict()))
         environment.update(self.parent.plan.environment)
         # Run the command under the prepared environment
-        return self.run(command, env=environment, **kwargs)
+        return self.run(command, env=environment, shell=True, **kwargs)
+
+    def stop(self):
+        """ Stop the guest """
+
+        self.debug(f"Doing nothing to stop guest '{self.guest}'.")
+
+    def reboot(self, hard=False):
+        """ Reboot the guest, return True if successful """
+
+        self.debug(f"Doing nothing to reboot guest '{self.guest}'.")
+
+        return False
 
     def push(self, source=None, destination=None, options=None):
         """ Nothing to be done to push workdir """
 
-    def pull(self, source=None, destination=None, options=None):
+    def pull(
+            self,
+            source=None,
+            destination=None,
+            options=None,
+            extend_options=None):
         """ Nothing to be done to pull workdir """
-
-    @classmethod
-    def requires(cls):
-        """ No packages needed to sync workdir """
-        return []

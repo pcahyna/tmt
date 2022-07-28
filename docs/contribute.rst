@@ -19,13 +19,14 @@ Our favorite thoughts from The Zen of Python:
 We respect the `PEP8`__ Style Guide for Python Code. Here's a
 couple of recommendations to keep on mind when writing code:
 
+* Maximum line length is 99 for code and 72 for documentation.
 * Comments should be complete sentences.
 * The first word should be capitalized (unless identifier).
 * When using hanging indent, the first line should be empty.
 * The closing brace/bracket/parenthesis on multiline constructs
-  is under the first non-whitespace character of the last line
+  is under the first non-whitespace character of the last line.
 
-__ https://github.com/psss/tmt
+__ https://github.com/teemtee/tmt
 __ https://www.python.org/dev/peps/pep-0008/
 
 
@@ -64,17 +65,17 @@ sure that you have all required packages installed on your box::
     sudo dnf install gcc {python3,libvirt,krb5,libpq}-devel
 
 Install ``python3-virtualenvwrapper`` to easily create and enable
-virtual environments using ``mkvirtualenv`` and ``workon``. Note
-that if you have freshly installed the package you need to open a
-new shell session to enable the wrapper functions::
+virtual environments using ``mkvirtualenv`` and ``workon``::
 
     sudo dnf install python3-virtualenvwrapper
 
+Note that if you have freshly installed the package you need to
+open a new shell session to enable the wrapper functions.
 Now let's create a new virtual environment and install ``tmt`` in
 editable mode there::
 
     mkvirtualenv tmt
-    git clone https://github.com/psss/tmt
+    git clone https://github.com/teemtee/tmt
     cd tmt
     pip install -e .
 
@@ -82,15 +83,15 @@ The main ``tmt`` package contains only the core dependencies. For
 building documentation, testing changes, importing/exporting test
 cases or advanced provisioning options install the extra deps::
 
-    pip install '.[docs]'
-    pip install '.[tests]'
-    pip install '.[convert]'
-    pip install '.[provision]'
+    pip install -e '.[docs]'
+    pip install -e '.[tests]'
+    pip install -e '.[convert]'
+    pip install -e '.[provision]'
 
 Or simply install all extra dependencies to make sure you have
 everything needed for the tmt development ready on your system::
 
-    pip install '.[all]'
+    pip install -e '.[all]'
 
 Install the ``pre-commit`` hooks to run all available checks
 for your commits to the project::
@@ -120,10 +121,23 @@ Run selected tests or plans in verbose mode::
     tmt run --verbose plan --name basic
     tmt run -v test -n smoke
 
-Execute the whole test coverage, including tests which need the
-full virtualization support (this may take a while)::
+Build the rpms and execute the whole test coverage, including
+tests which need the full virtualization support::
 
+    make rpm
     tmt -c how=full run
+
+This would install the freshly built rpms on your laptop. In order
+to run the full test suite more safely under a virtual machine run
+the full test suite wrapper against the desired branch::
+
+    cd tests/full
+    tmt run --environment BRANCH=target
+
+Or schedule the full test suite under an external test system::
+
+    cd tests/full
+    tmt test export --fmf-id | wow fedora-35 x86_64 --fmf-id -
 
 To run unit tests using pytest and generate coverage report::
 
@@ -178,23 +192,25 @@ amending the original commit and doing a force push. This will
 make it easier for the reviewers to see what has recently changed.
 
 Once the pull request has been successfully reviewed and all tests
-passed, please rebase on the latest master and squash the changes
-into a single commit. Use multiple commits to group relevant code
-changes if the pull request is too large for a single commit.
+passed, please rebase on the latest ``main`` branch content and
+squash the changes into a single commit. Use multiple commits to
+group relevant code changes if the pull request is too large for a
+single commit.
 
 
 Merging
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Pull request merging is done by maintainers who have a good
-overview of the whole code. Before merging a pull request it's
-good to check the following:
+Pull request merging is done by one of maintainers who have a good
+overview of the whole code. Maintainer who will take care of
+the process will assign themselves to the pull request.
+Before merging it's good to check the following:
 
 * New test coverage added if appropriate, all tests passed
 * Documentation has been added or updated where appropriate
 * Commit messages are sane, commits are reasonably squashed
 * At least one positive review provided by the maintainers
-* Merge commits are not used, rebase on the master instead
+* Merge commits are not used, rebase on the ``main`` instead
 
 Pull requests which should not or cannot be merged are marked with
 the ``blocked`` label. For complex topics which need more eyes to
@@ -241,6 +257,7 @@ Follow the steps below to create a new major or minor release:
 
 * Run the full test coverage using ``tmt -c how=full run``
 * Use ``git log --oneline --no-decorate x.y-1..`` to generate the changelog
+* Update ``README`` with new contributors since the last release
 * Add a ``Release tmt-x.y.0`` commit with the specfile update
 * Create a pull request with the commit, ensure tests pass
 
@@ -256,7 +273,7 @@ Release a new package to Fedora and EPEL repositories:
 * Ensure the proposed changes are ok and commit them
 * Create a pull request against rawhide from your fork
 * After tests pass, merge the pull request to rawhide
-* Build the package for rawhide ``fedkpkg build --nowait``
+* Build the package for rawhide ``fedpkg build --nowait``
 * Build package for all `active releases`__
   ``git checkout f33 && git merge rawhide && git push && fedpkg build --nowait``
 * Create a bodhi update for each release
@@ -264,9 +281,9 @@ Release a new package to Fedora and EPEL repositories:
 
 Finally, if everything went well:
 
-* **Manually** merge the original release pull request on github (to avoid rebase)
-  ``git checkout master && git merge --ff-only <release_branch> && git push origin master``
 * Tag the commit with ``x.y.0``, push tags ``git push --tags``
+* **Manually** merge the original release pull request on github (to avoid rebase)
+  ``git checkout main && git merge --ff-only <release_branch> && git push origin main``
 * Create a new `github release`__ based on the tag above
 * If the automation triggered by publishing the new github release
   was not successful, publish the fresh code to the `pypi`__
@@ -277,6 +294,6 @@ Finally, if everything went well:
 * Close the corresponding release milestone
 
 __ https://bodhi.fedoraproject.org/releases/
-__ https://github.com/psss/tmt/releases/
+__ https://github.com/teemtee/tmt/releases/
 __ https://pypi.org/project/tmt/
 __ https://copr.fedorainfracloud.org/coprs/psss/tmt/builds/

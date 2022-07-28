@@ -1,0 +1,15 @@
+discover:
+    how: fmf
+provision:
+    how: virtual
+    image: fedora-35
+execute:
+    how: upgrade
+    url: https://github.com/teemtee/upgrade
+
+/no-path:
+    summary: Basic upgrade test with no upgrade path
+/path:
+    summary: Basic upgrade test with upgrade path
+    execute+:
+        upgrade-path: /paths/fedora35to36

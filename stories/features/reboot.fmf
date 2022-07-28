@@ -5,25 +5,34 @@ story:
 description: |
     Some tests may require a reboot as a part of them, e.g.
     upgrading the system, rebooting and then running some checks.
+    The ``tmt-reboot`` command can be used to request the guest
+    reboot from the test and the ``TMT_REBOOT_COUNT`` environment
+    variable provides number of successfully completed reboots.
 
-    The functionality is compatible with how restraint
-    works, hence ``rhts-reboot``, ``rstrnt-reboot`` or ``tmt-reboot``
-    can be used to start the reboot. The ``REBOOT_COUNT`` environment
-    variable is used to pass the test information about the number
-    of reboots done.
+    Note that this only works with guests provisioned by tmt, e.g.
+    ``container`` or ``virtual``, and doesn't work with the
+    ``local`` provision method. Support of the ``connect``
+    provision is on a best effort basis and will not work on
+    machines where ``reboot`` command is not available.
 
-    Note that this only works with the internal tmt executor and
-    works with guests provisioned by tmt (e.g. container or
-    virtual) and doesn't work with the local provision.
-    Support of connect provision is on a best effort basis and
-    will not work on machines where ``reboot`` command is not
-    available.
+    When a custom command for rebooting is required, the ``-c``
+    option of the reboot script can be used, e.g. ``tmt-reboot -c
+    "dnf system-upgrade reboot"``.
+
+    For backward-compatibility with the `restraint`__ framework
+    the ``rstrnt-reboot`` and ``rhts-reboot`` commands are provided
+    as well together with the ``RSTRNT_REBOOTCOUNT`` and ``REBOOTCOUNT``
+    environment variables. Calling the script kills the parent process
+    (the running test). Please note that the content of these
+    scripts is not preserved, ``tmt`` overwrites them.
+
+    __ https://restraint.readthedocs.io/en/latest/commands.html#rstrnt-reboot
 
 example: |
-    if [ -z "$REBOOT_COUNT" ] || [ "$REBOOT_COUNT" -eq 0 ]; then
+    if [ "$TMT_REBOOT_COUNT" -eq 0 ]; then
         rlRun "echo 'Before the reboot'"
-        rlRun "rhts-reboot" 0 "Reboot the machine"
-    elif [ "$REBOOT_COUNT" -eq 1 ]; then
+        rlRun "tmt-reboot" 0 "Reboot the machine"
+    elif [ "$TMT_REBOOT_COUNT" -eq 1 ]; then
         rlRun "echo 'After the reboot'"
     fi
 link:

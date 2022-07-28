@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import re
+import sys
 from io import open
 
 from setuptools import setup
@@ -14,6 +15,13 @@ with open('tmt.spec', encoding='utf-8') as specfile:
 # acceptable version schema: major.minor[.patch][sub]
 __version__ = version
 __pkg__ = 'tmt'
+__pkgdata__ = {
+    'tmt': [
+        'schemas/*.yaml',
+        'steps/execute/scripts/*',
+        'steps/report/html/*'
+        ]
+}
 __pkgdir__ = {}
 __pkgs__ = [
     'tmt',
@@ -32,18 +40,44 @@ __scripts__ = ['bin/tmt']
 
 # Prepare install requires and extra requires
 install_requires = [
-    'fmf>=0.16.0',
+    'fmf>=1.1.0',
     'click',
     'requests',
-    'ruamel.yaml'
-]
+    'ruamel.yaml',
+    ]
+
+# typing_extensions is needed with Python 3.7 and older, types imported
+# from that package (Literal, Protocol, TypedDict, ...) become available
+# from typing since Python 3.8.
+install_requires.append("typing-extensions>=3.7.4.3; python_version < '3.8'")
+
+# dataclasses is needed with Python 3.6
+install_requires.append("dataclasses; python_version < '3.7'")
+
+# entry_points is part of Python 3.9+
+install_requires.append("importlib_metadata; python_version < '3.9'")
+
 extras_require = {
-    'docs': ['sphinx>=3', 'sphinx_rtd_theme', 'mock'],
-    'tests': ['pytest', 'python-coveralls', 'mock', 'requre', 'pre-commit'],
-    'provision': ['testcloud>=0.6.1'],
-    'convert': ['nitrate', 'markdown', 'python-bugzilla'],
+    'docs': [
+        'sphinx>=3',
+        'sphinx_rtd_theme'],
+    'tests': [
+        'flake8',
+        'pytest',
+        'python-coveralls',
+        'requre',
+        'pre-commit',
+        'mypy'
+        ],
+    'provision': ['testcloud>=0.8.1'],
+    'convert': [
+        'nitrate',
+        'markdown',
+        'python-bugzilla',
+        'html2text'],
     'report-html': ['jinja2'],
     'report-junit': ['junit_xml'],
+    'export-polarion': ['pylero'],
 }
 extras_require['all'] = [
     dependency
@@ -58,8 +92,8 @@ readme = 'README.rst'
 with open(readme, encoding='utf-8') as _file:
     readme = _file.read()
 
-github = 'https://github.com/psss/tmt'
-download_url = '{0}/archive/master.zip'.format(github)
+github = 'https://github.com/teemtee/tmt'
+download_url = '{0}/archive/main.zip'.format(github)
 
 default_setup = dict(
     url=github,
@@ -71,8 +105,6 @@ default_setup = dict(
     download_url=download_url,
     long_description=readme,
     data_files=[],
-    package_data={
-        'tmt/steps/execute': ['run.sh']},
     classifiers=[
         'License :: OSI Approved :: MIT License',
         'Natural Language :: English',
@@ -88,6 +120,7 @@ default_setup = dict(
     install_requires=install_requires,
     extras_require=extras_require,
     name=__pkg__,
+    package_data=__pkgdata__,
     package_dir=__pkgdir__,
     packages=__pkgs__,
     provides=__provides__,

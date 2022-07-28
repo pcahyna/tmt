@@ -1,9 +1,29 @@
+import dataclasses
 import os
-import re
+from typing import Optional
 
 import click
 
 import tmt
+import tmt.steps.provision
+
+# Timeout in seconds of waiting for a connection
+CONNECTION_TIMEOUT = 60
+
+# Defaults
+DEFAULT_IMAGE = "fedora"
+DEFAULT_USER = "root"
+
+# TODO: get rid of `ignore` once superclass is no longer `Any`
+
+
+@dataclasses.dataclass
+class PodmanGuestData(tmt.steps.provision.GuestData):  # type: ignore[misc]
+    image: str = DEFAULT_IMAGE
+    user: str = DEFAULT_USER
+    force_pull: bool = False
+
+    container: Optional[str] = None
 
 
 class ProvisionPodman(tmt.steps.provision.ProvisionPlugin):
@@ -17,13 +37,16 @@ class ProvisionPodman(tmt.steps.provision.ProvisionPlugin):
             image: fedora:latest
 
     In order to always pull the fresh container image use 'pull: true'.
+
+    In order to run the container with different user as the default 'root',
+    use 'user: USER'.
     """
 
     # Guest instance
     _guest = None
 
     # Supported keys
-    _keys = ["image", "container", "pull"]
+    _keys = ["image", "container", "pull", "user"]
 
     # Supported methods
     _methods = [tmt.steps.Method(name='container', doc=__doc__, order=50)]
@@ -41,15 +64,17 @@ class ProvisionPodman(tmt.steps.provision.ProvisionPlugin):
             click.option(
                 '-p', '--pull', is_flag=True,
                 help='Force pulling a fresh container image.'),
+            click.option(
+                '-u', '--user', metavar='USER',
+                help='User to use for all container operations.')
             ] + super().options(how)
 
     def default(self, option, default=None):
         """ Return default data for given option """
-        # User 'fedora' as a default image
-        if option == 'image':
-            return 'fedora'
-        # No other defaults available
-        return default
+        if option == 'pull':
+            return PodmanGuestData().force_pull
+
+        return getattr(PodmanGuestData(), option.replace('-', '_'), default)
 
     def wake(self, keys=None, data=None):
         """ Wake up the plugin, process data, apply options """
@@ -69,9 +94,15 @@ class ProvisionPodman(tmt.steps.provision.ProvisionPlugin):
         self.info('image', f"{self.get('image')}{pull}", 'green')
 
         # Prepare data for the guest instance
-        data = dict()
-        for key in self._keys:
-            data[key] = self.get(key)
+        data_from_options = {
+            key: self.get(key)
+            for key in PodmanGuestData.keys()
+            if key != 'force_pull'
+            }
+
+        data_from_options['force_pull'] = self.get('pull')
+
+        data = PodmanGuestData(**data_from_options)
 
         # Create a new GuestTestcloud instance and start it
         self._guest = GuestContainer(data, name=self.name, parent=self.step)
@@ -89,25 +120,12 @@ class ProvisionPodman(tmt.steps.provision.ProvisionPlugin):
 class GuestContainer(tmt.Guest):
     """ Container Instance """
 
-    def load(self, data):
-        """ Load guest data and initialize attributes """
-        super().load(data)
+    _data_class = PodmanGuestData
 
-        # Load basic data
-        self.image = data.get('image')
-        self.force_pull = data.get('pull')
-        self.container = data.get('container')
-
-        # Instances variables initialized later
-        self.container_id = None
-
-    def save(self):
-        """ Save guest data for future wake up """
-        data = {
-            'container': self.container,
-            'image': self.image,
-            }
-        return data
+    image: Optional[str]
+    container: Optional[str]
+    user: str
+    force_pull: bool
 
     def wake(self):
         """ Wake up the guest """
@@ -132,9 +150,7 @@ class GuestContainer(tmt.Guest):
         # Mount the whole plan directory in the container
         workdir = self.parent.plan.workdir
 
-        # Deduce container name from workdir, because it is a path
-        # make it podman container name friendly
-        self.container = 'tmt' + re.sub('[/ ]', '-', workdir)
+        self.container = self.guest = self._tmt_name()
         self.verbose('name', self.container, 'green')
 
         # FIXME: Workaround for BZ#1900021 (f34 container on centos-8)
@@ -142,38 +158,40 @@ class GuestContainer(tmt.Guest):
 
         # Run the container
         self.debug(f"Start container '{self.image}'.")
-        self.container_id = self.podman(
+        self.podman(
             ['run'] + workaround +
-            ['--name', self.container, '-v', f'{workdir}:{workdir}:Z',
-             '-itd', self.image])[0].strip()
+            ['--name', self.container, '-v', f'{workdir}:{workdir}:z',
+             '-itd', '--user', self.user, self.image])
 
-    def reboot(self, hard=False):
+    def reboot(self, hard=False, command=None):
         """ Restart the container, return True if successful  """
+        if command:
+            raise tmt.utils.ProvisionError(
+                "Custom reboot command not supported in podman provision.")
         if not hard:
             raise tmt.utils.ProvisionError(
                 "Containers do not support soft reboot, they can only be "
                 "stopped and started again (hard reboot).")
         self.podman(['container', 'restart', self.container])
-        return self.reconnect()
+        return self.reconnect(timeout=CONNECTION_TIMEOUT)
 
     def ansible(self, playbook, extra_args=None):
         """ Prepare container using ansible playbook """
         playbook = self._ansible_playbook_path(playbook)
         # As non-root we must run with podman unshare
-        podman_unshare = 'podman unshare ' if os.geteuid() != 0 else ''
+        podman_unshare = ['podman', 'unshare'] if os.geteuid() != 0 else []
         stdout, stderr = self.run(
-            f'stty cols {tmt.utils.OUTPUT_WIDTH}; '
-            f'{self._export_environment()}'
-            f'{podman_unshare}ansible-playbook '
-            f'{self._ansible_verbosity()} '
-            f'{self._ansible_extra_args(extra_args)} '
-            f'-c podman -i {self.container}, {playbook}',
-            cwd=self.parent.plan.worktree)
+            podman_unshare + ['ansible-playbook'] +
+            self._ansible_verbosity() +
+            self._ansible_extra_args(extra_args) +
+            ['-c', 'podman', '-i', f'{self.container},', playbook],
+            cwd=self.parent.plan.worktree,
+            env=self._prepare_environment())
         self._ansible_summary(stdout)
 
     def podman(self, command, **kwargs):
         """ Run given command via podman """
-        return self.run(['podman'] + command, shell=False, **kwargs)
+        return self.run(['podman'] + command, **kwargs)
 
     def execute(self, command, **kwargs):
         """ Execute given commands in podman via shell """
@@ -187,7 +205,8 @@ class GuestContainer(tmt.Guest):
             directory = f"cd '{directory}'; "
 
         # Prepare the environment variables export
-        environment = self._export_environment(kwargs.get('env', dict()))
+        environment = self._export_environment(
+            self._prepare_environment(kwargs.get('env', dict())))
 
         # Run in interactive mode if requested
         interactive = ['-it'] if kwargs.get('interactive') else []
@@ -199,12 +218,25 @@ class GuestContainer(tmt.Guest):
         command = directory + environment + command
         return self.podman(
             ['exec'] + interactive +
-            [self.container or 'dry', 'sh', '-c', command], **kwargs)
+            [self.container or 'dry', 'bash', '-c', command], **kwargs)
 
     def push(self, source=None, destination=None, options=None):
-        """ Nothing to be done to push workdir """
+        """ Make sure that the workdir has a correct selinux context """
+        self.debug("Update selinux context of the run workdir.", level=3)
+        self.run(
+            ["chcon", "--recursive", "--type=container_file_t",
+             self.parent.plan.workdir], shell=False)
+        # In case explicit destination is given, use `podman cp` to copy data
+        # to the container
+        if destination:
+            self.podman(["cp", source, f"{self.container}:{destination}"])
 
-    def pull(self, source=None, destination=None, options=None):
+    def pull(
+            self,
+            source=None,
+            destination=None,
+            options=None,
+            extend_options=None):
         """ Nothing to be done to pull workdir """
 
     def stop(self):
@@ -218,8 +250,3 @@ class GuestContainer(tmt.Guest):
         if self.container:
             self.podman(['container', 'rm', '-f', self.container])
             self.info('container', 'removed', 'green')
-
-    @classmethod
-    def requires(cls):
-        """ No packages needed to sync workdir to the container """
-        return []

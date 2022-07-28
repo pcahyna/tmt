@@ -2,20 +2,24 @@
 """ Base Metadata Classes """
 
 import copy
+import dataclasses
 import functools
 import os
 import re
 import shutil
 import subprocess
 import time
+from typing import List, Optional, Tuple
 
 import click
 import fmf
+import fmf.base
 from click import echo, style
 from fmf.utils import listed
 from ruamel.yaml.error import MarkedYAMLError
 
 import tmt.export
+import tmt.identifier
 import tmt.steps
 import tmt.steps.discover
 import tmt.steps.execute
@@ -31,6 +35,7 @@ from tmt.utils import verdict
 # metadata and 1h for scripts defined directly in plans (L2 metadata).
 DEFAULT_TEST_DURATION_L1 = '5m'
 DEFAULT_TEST_DURATION_L2 = '1h'
+DEFAULT_ORDER = 50
 
 # How many already existing lines should tmt run --follow show
 FOLLOW_LINES = 10
@@ -41,7 +46,10 @@ OBSOLETED_TEST_KEYS = "relevancy coverage".split()
 # Unofficial temporary test keys
 EXTRA_TEST_KEYS = (
     "extra-nitrate extra-hardware extra-pepa "
-    "extra-summary extra-task".split())
+    "extra-summary extra-task id".split())
+
+# Unofficial temporary story keys
+EXTRA_STORY_KEYS = ("id".split())
 
 SECTIONS_HEADINGS = {
     'Setup': ['<h1>Setup</h1>'],
@@ -56,6 +64,49 @@ SECTIONS_HEADINGS = {
     }
 
 
+# See https://fmf.readthedocs.io/en/latest/concept.html#identifiers for
+# formal specification.
+@dataclasses.dataclass
+class FmfId:
+    url: Optional[str] = None
+    ref: Optional[str] = None
+    path: Optional[str] = None
+    name: Optional[str] = None
+
+    def validate(self) -> Tuple[bool, str]:
+        """
+        Validate fmf id and return a human readable error
+
+        Return a tuple (boolean, message) as the result of validation.
+        The boolean specifies the validation result and the message
+        the validation error. In case the FMF id is valid, return an empty
+        string as the message.
+        """
+        # Validate remote id and translate to human readable errors
+        try:
+            # Simple asdict() is not good enough, fmf does not like keys that exist but are `None`.
+            # Don't include those.
+            fmf.base.Tree.node({
+                key: value for key, value in dataclasses.asdict(self).items()
+                if value is not None
+                })
+        except fmf.utils.GeneralError as error:
+            # Map fmf errors to more user friendly alternatives
+            error_map: List[Tuple[str, str]] = [
+                ('git clone', f"repo '{self.url}' cannot be cloned"),
+                ('git checkout', f"git ref '{self.ref}' is invalid"),
+                ('directory path', f"path '{self.path}' is invalid"),
+                ('tree root', f"No tree found in repo '{self.url}', missing an '.fmf' directory?")
+                ]
+
+            stringified_error = str(error)
+
+            errors = [message for needle, message in error_map if needle in stringified_error]
+            return (False, errors[0] if errors else stringified_error)
+
+        return (True, '')
+
+
 class Core(tmt.utils.Common):
     """
     General node object
@@ -66,7 +117,7 @@ class Core(tmt.utils.Common):
     """
 
     # Core attributes (supported across all levels)
-    _keys = ['summary', 'description', 'enabled', 'link', 'adjust']
+    _keys = ['summary', 'description', 'enabled', 'order', 'link', 'id', 'adjust']
 
     def __init__(self, node, parent=None):
         """ Initialize the node """
@@ -86,9 +137,20 @@ class Core(tmt.utils.Common):
         # Check whether the node is enabled, handle the default
         self._check('enabled', expected=bool, default=True)
 
+        # Check whether the order is integer, handle the default
+        self._check('order', expected=int, default=DEFAULT_ORDER)
+
         # Convert link into the canonical form, store the object
         self._link = Link(self.link)
         self.link = self._link.get()
+
+        # Store the unique id if provided
+        try:
+            self.id = tmt.identifier.get_id(self.node)
+        except tmt.identifier.IdLeafError:
+            raise tmt.utils.SpecificationError(
+                f"The 'id' key '{self.node.get('id')}' in '{self.name}' "
+                f"is inherited from parent, should be defined in a leaf.")
 
     def __str__(self):
         """ Node name """
@@ -99,8 +161,10 @@ class Core(tmt.utils.Common):
         self._metadata.update(self.export(format_='dict'))
         self._metadata['name'] = self.name
 
-    def _sources(self):
+    def _show_additional_keys(self):
         """ Show source files """
+        if self.id is not None:
+            echo(tmt.utils.format('id', self.id, key_color='magenta'))
         echo(tmt.utils.format(
             'sources', self.node.sources, key_color='magenta'))
 
@@ -139,14 +203,17 @@ class Core(tmt.utils.Common):
 
         def run(command):
             """ Run command, return output """
+            cwd = fmf_root
             result = subprocess.run(
                 command.split(),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL)
+                stderr=subprocess.DEVNULL,
+                cwd=cwd)
             return result.stdout.strip().decode("utf-8")
 
         fmf_id = {'name': self.name}
 
+        fmf_root = self.node.root
         # Prepare url (for now handle just the most common schemas)
         branch = run("git rev-parse --abbrev-ref --symbolic-full-name @{u}")
         try:
@@ -163,7 +230,6 @@ class Core(tmt.utils.Common):
 
         # Construct path (if different from git root)
         git_root = run('git rev-parse --show-toplevel')
-        fmf_root = self.node.root
         if git_root != fmf_root:
             fmf_id['path'] = os.path.join(
                 '/', os.path.relpath(fmf_root, git_root))
@@ -182,12 +248,14 @@ class Core(tmt.utils.Common):
             current = os.getcwd()
             # Handle special case when directly in the metadata root
             if current == root:
-                path = '/'
+                pattern = '/'
             # Prepare path from the tree root to the current directory
             else:
-                path = os.path.join('/', os.path.relpath(current, root))
-            cls._context.params['names'] = (
-                path if name == '.' else name for name in names)
+                pattern = os.path.join('/', os.path.relpath(current, root))
+                # Prevent matching common prefix from other directories
+                pattern = f"{pattern}(/|$)"
+            cls._context.params['names'] = tuple([
+                pattern if name == '.' else name for name in names])
 
     def name_and_summary(self):
         """ Node name and optional summary """
@@ -206,7 +274,12 @@ class Core(tmt.utils.Common):
         """ Export data into requested format (yaml or dict) """
         if keys is None:
             keys = self._keys
-        data = dict([(key, getattr(self, key)) for key in keys])
+
+        # Always include node name, add requested keys, ignore adjust
+        data = dict(name=self.name)
+        data.update(dict([(key, getattr(self, key)) for key in keys]))
+        data.pop('adjust', None)
+
         # Choose proper format
         if format_ == 'dict':
             return data
@@ -214,7 +287,7 @@ class Core(tmt.utils.Common):
             return tmt.utils.dict_to_yaml(data)
         else:
             raise tmt.utils.GeneralError(
-                f"Invalid test export format '{format_}'.")
+                f"Invalid export format '{format_}'.")
 
     def lint_keys(self, additional_keys):
         """ Return list of invalid keys used, empty when all good """
@@ -278,6 +351,7 @@ class Test(Core):
         'environment',
         'duration',
         'enabled',
+        'order',
         'result',
 
         # Filtering attributes
@@ -311,6 +385,12 @@ class Test(Core):
         else:
             node = data
         super().__init__(node)
+
+        # Test script or path to the manual test must be defined
+        self._check('test', expected=str)
+        if self.test is None:
+            raise tmt.utils.SpecificationError(
+                f"The 'test' attribute in '{self.name}' must be defined.")
 
         # Path defaults to the directory where metadata are stored or to
         # the root '/' if fmf metadata were not stored on the filesystem
@@ -400,15 +480,18 @@ class Test(Core):
         """ Show test details """
         self.ls()
         for key in self._keys:
+            value = getattr(self, key)
             # Special handling for the link attribute
             if key == 'link':
                 self._link.show()
                 continue
-            value = getattr(self, key)
+            # No need to show the default order
+            if key == 'order' and value == DEFAULT_ORDER:
+                continue
             if value not in [None, list(), dict()]:
                 echo(tmt.utils.format(key, value))
         if self.opt('verbose'):
-            self._sources()
+            self._show_additional_keys()
             self._fmf_id()
         if self.opt('verbose', 0) >= 2:
             # Print non-empty unofficial attributes
@@ -419,6 +502,24 @@ class Test(Core):
                 value = self.node.get(key)
                 if value not in [None, list(), dict()]:
                     echo(tmt.utils.format(key, value, key_color='blue'))
+
+    def _lint_manual(self, test_path):
+        """ Check that the manual instructions respect the specification """
+        manual_test = os.path.join(test_path, self.test)
+
+        # File does not exist
+        if not os.path.exists(manual_test):
+            return verdict(False, f"file '{self.test}' does not exist")
+
+        # Check syntax for warnings
+        warnings = tmt.export.check_md_file_respects_spec(manual_test)
+        if warnings:
+            for warning in warnings:
+                verdict(False, warning)
+            return False
+
+        # Everything looks ok
+        return verdict(True, f"correct manual test syntax in '{self.test}'")
 
     def lint(self):
         """
@@ -442,10 +543,7 @@ class Test(Core):
 
         # Check for possible test case relevancy rules
         filename = self.node.sources[-1]
-        syntax_ok, metadata = tmt.utils.yaml_to_dict(self.read(filename), True)
-        if not syntax_ok:
-            verdict(None, 'seems to use YAML 1.1 syntax which will be '
-                          'deprecated in tmt 2.0')
+        metadata = tmt.utils.yaml_to_dict(self.read(filename))
         relevancy = metadata.pop('relevancy', None)
         if relevancy:
             # Convert into adjust rules if --fix enabled
@@ -475,14 +573,8 @@ class Test(Core):
 
         # Check if the format of Markdown file respects the specification
         # https://tmt.readthedocs.io/en/latest/spec/tests.html#manual
-        md_path = tmt.export.return_markdown_file()
-        if os.path.exists(md_path):
-            invalid_md_file = tmt.export.check_md_file_respects_spec(md_path)
-            if invalid_md_file:
-                for i in invalid_md_file:
-                    verdict(False, i)
-            else:
-                verdict(True, "correct headings are used in the Markdown file")
+        if self.manual:
+            valid &= self._lint_manual(test_path)
 
         return valid
 
@@ -497,7 +589,6 @@ class Test(Core):
 
         # Prepare special format for the executor
         if format_ == 'execute':
-            name = self.name
             data = dict()
             data['test'] = self.test
             data['path'] = self.path
@@ -513,17 +604,23 @@ class Test(Core):
         elif format_ == 'nitrate':
             tmt.export.export_to_nitrate(self)
 
-        # Common node export otherwise
+        # Export to Polarion test case management system
+        elif format_ == 'polarion':
+            tmt.export.export_to_polarion(self)
+
+        # Export the fmf identifier
         elif keys == 'fmf-id':
             if format_ == 'dict':
                 return self.fmf_id
-            elif format_ == "yaml":
-                return tmt.utils.dict_to_yaml(self.fmf_id, start=True)
+            elif format_ == 'yaml':
+                return tmt.utils.dict_to_yaml(self.fmf_id)
             else:
                 raise tmt.utils.GeneralError(
                     f"Invalid test export format '{format_}'.")
+
+        # Common node export otherwise
         else:
-            return super(Test, self).export(format_, keys)
+            return super().export(format_, keys)
 
 
 class Plan(Core):
@@ -532,34 +629,44 @@ class Plan(Core):
     extra_L2_keys = [
         'context',
         'environment',
+        'environment-file',
         'gate',
         ]
 
     def __init__(self, node, run=None):
         """ Initialize the plan """
+        super().__init__(node, parent=run)
+
+        # Save the run, prepare worktree and plan data directory
         self.my_run = run
+        if self.my_run:
+            # Skip to initialize the work tree if the corresponding option is
+            # true. Note that 'tmt clean' consumes the option because it
+            # should not initialize the work tree at all.
+            if not run.opt(tmt.utils.PLAN_SKIP_WORKTREE_INIT):
+                self._initialize_worktree()
+
+            self._initialize_data_directory()
+
+        # Store 'environment' and 'environment-file' keys content
         self._environment = self._get_environment_vars(node)
         # Expand all environment variables in the node
         with tmt.utils.modify_environ(self.environment):
             self._expand_node_data(node.data)
-        super().__init__(node, parent=run)
 
         # Initialize test steps
         self.discover = tmt.steps.discover.Discover(
-            self.node.get('discover'), self)
+            plan=self, data=self.node.get('discover'))
         self.provision = tmt.steps.provision.Provision(
-            self.node.get('provision'), self)
+            plan=self, data=self.node.get('provision'))
         self.prepare = tmt.steps.prepare.Prepare(
-            self.node.get('prepare'), self)
+            plan=self, data=self.node.get('prepare'))
         self.execute = tmt.steps.execute.Execute(
-            self.node.get('execute'), self)
+            plan=self, data=self.node.get('execute'))
         self.report = tmt.steps.report.Report(
-            self.node.get('report'), self)
+            plan=self, data=self.node.get('report'))
         self.finish = tmt.steps.finish.Finish(
-            self.node.get('finish'), self)
-
-        # Initialize workdir tree
-        self._initialize_worktree()
+            plan=self, data=self.node.get('finish'))
 
         # Relevant gates (convert to list if needed)
         self.gate = node.get('gate')
@@ -587,10 +694,12 @@ class Plan(Core):
     @property
     def environment(self):
         """ Return combined environment from plan data and command line """
-        if self.my_run and self.my_run.environment:
+        if self.my_run:
             combined = self._environment.copy()
             # Command line variables take precedence
             combined.update(self.my_run.environment)
+            # Include path to the plan data directory
+            combined["TMT_PLAN_DATA"] = self.data_directory
             return combined
         else:
             return self._environment
@@ -603,7 +712,7 @@ class Plan(Core):
             raise tmt.utils.SpecificationError(
                 f"The 'environment-file' should be a list. "
                 f"Received '{type(environment_files).__name__}'.")
-        combined = tmt.utils.environment_file_to_dict(
+        combined = tmt.utils.environment_files_to_dict(
             environment_files, root=node.root)
 
         # Environment variables from key, make sure that values are string
@@ -621,24 +730,33 @@ class Plan(Core):
 
         Used as cwd in prepare, execute and finish steps.
         """
-        # Bail out if workdir does not exist (not running the plan)
-        if not self.workdir:
-            return
-
         self.worktree = os.path.join(self.workdir, 'tree')
         tree_root = self.my_run.tree.root
 
         # Create an empty directory if there's no metadata tree
         if not tree_root:
-            self.debug('Create an empty worktree (no metadata tree).')
+            self.debug('Create an empty worktree (no metadata tree).', level=2)
             os.makedirs(self.worktree, exist_ok=True)
             return
 
         # Sync metadata root to the worktree
-        self.debug(f"Sync the worktree to '{self.worktree}'.")
+        self.debug(f"Sync the worktree to '{self.worktree}'.", level=2)
         self.run([
             "rsync", "-ar", "--exclude", ".git",
-            f"{tree_root}/", self.worktree], shell=False)
+            f"{tree_root}/", self.worktree])
+
+    def _initialize_data_directory(self):
+        """
+        Create the plan data directory
+
+        This is used for storing logs and other artifacts created during
+        prepare step, test execution or finish step and which are pulled
+        from the guest for possible future inspection.
+        """
+        self.data_directory = os.path.join(self.workdir, "data")
+        self.debug(
+            f"Create the data directory '{self.data_directory}'.", level=2)
+        os.makedirs(self.data_directory, exist_ok=True)
 
     def _fmf_context(self):
         """ Return combined context from plan data and command line """
@@ -666,12 +784,16 @@ class Plan(Core):
                     #        using round-trip mode and since it comes from the
                     #        command-line, no formatting is applied resulting
                     #        in inconsistent formatting. Using a safe loader in
-                    #        this case is a hack to make it forget, though there
-                    #        may be a better way to do this.
-                    data = tmt.utils.yaml_to_dict(option, yaml_type='safe')
-                    if not data:
+                    #        this case is a hack to make it forget, though
+                    #        there may be a better way to do this.
+                    try:
+                        data = tmt.utils.yaml_to_dict(option, yaml_type='safe')
+                        if not (data):
+                            raise tmt.utils.GeneralError("Step data cannot be empty.")
+                    except tmt.utils.GeneralError as error:
                         raise tmt.utils.GeneralError(
-                            f"Invalid step data for {step}: '{data}'.")
+                            f"Invalid step data for {step}: '{option}'"
+                            f"\n{error}")
                     step_data.append(data)
                 except MarkedYAMLError as error:
                     raise tmt.utils.GeneralError(
@@ -752,12 +874,14 @@ class Plan(Core):
             echo(tmt.utils.format(
                 'environment', self.environment, key_color='blue'))
         echo(tmt.utils.format('enabled', self.enabled, key_color='cyan'))
+        if self.order != DEFAULT_ORDER:
+            echo(tmt.utils.format('order', self.order, key_color='cyan'))
         self._link.show()
         if self._fmf_context():
             echo(tmt.utils.format(
                 'context', self._fmf_context(), key_color='blue'))
         if self.opt('verbose'):
-            self._sources()
+            self._show_additional_keys()
 
     def _lint_execute(self):
         """ Lint execute step """
@@ -814,9 +938,13 @@ class Plan(Core):
     def _lint_discover_fmf(discover):
         """ Lint fmf discover method """
         # Validate remote id and translate to human readable errors
-        valid, error = tmt.utils.validate_fmf_id(
-            {key: value for key, value in discover.items()
-                if key in ['url', 'ref', 'path']})
+        fmf_id_data = {
+            key: value
+            for key, value in discover.items()
+            if key in ['url', 'ref', 'path']
+            }
+
+        valid, error = FmfId(**fmf_id_data).validate()
 
         if valid:
             name = discover.get('name')
@@ -883,6 +1011,27 @@ class Plan(Core):
         for step in self.steps(disabled=True):
             step.setup_actions()
 
+        # Check if steps are not in stand-alone mode
+        standalone = set()
+        for step in self.steps():
+            standalone_plugins = step.plugins_in_standalone_mode
+            if standalone_plugins == 1:
+                standalone.add(step.name)
+            elif standalone_plugins > 1:
+                raise tmt.utils.GeneralError(
+                    f"Step '{step.name}' has multiple plugin configs which "
+                    f"require running on their own. Combination of such "
+                    f"configs is not possible.")
+        if len(standalone) > 1:
+            raise tmt.utils.GeneralError(
+                f'These steps require running on their own, their combination '
+                f'with the given options is not compatible: '
+                f'{fmf.utils.listed(standalone)}.')
+        elif standalone:
+            self._context.obj.steps = standalone
+            self.debug(
+                f"Running the '{list(standalone)[0]}' step as standalone.")
+
         # Run enabled steps except 'finish'
         self.debug('go', color='cyan', shift=0, level=2)
         try:
@@ -902,6 +1051,33 @@ class Plan(Core):
             if not abort and self.finish.enabled:
                 self.finish.go()
 
+    def export(self, format_='yaml'):
+        """
+        Export plan data into requested format
+
+        Supported formats are 'yaml' and 'dict'.
+        """
+        data = super().export(format_='dict')
+
+        for key in self.extra_L2_keys:
+            value = self.node.data.get(key)
+            if value:
+                data[key] = value
+
+        for step in tmt.steps.STEPS:
+            value = self.node.data.get(step)
+            if value:
+                data[step] = value
+
+        # Choose proper format
+        if format_ == 'dict':
+            return data
+        elif format_ == 'yaml':
+            return tmt.utils.dict_to_yaml(data)
+        else:
+            raise tmt.utils.GeneralError(
+                f"Invalid plan export format '{format_}'.")
+
 
 class Story(Core):
     """ User story object """
@@ -911,9 +1087,11 @@ class Story(Core):
         'summary',
         'title',
         'story',
+        'priority',
         'description',
         'example',
         'enabled',
+        'order',
         'link',
         ]
 
@@ -1002,15 +1180,17 @@ class Story(Core):
         """ Show story details """
         self.ls()
         for key in self._keys:
+            value = getattr(self, key)
             if key == 'link':
                 self._link.show()
                 continue
-            value = getattr(self, key)
+            if key == 'order' and value == DEFAULT_ORDER:
+                continue
             if value is not None:
                 wrap = False if key == 'example' else 'auto'
                 echo(tmt.utils.format(key, value, wrap=wrap))
         if self.opt('verbose'):
-            self._sources()
+            self._show_additional_keys()
 
     def coverage(self, code, test, docs):
         """ Show story coverage """
@@ -1060,10 +1240,17 @@ class Story(Core):
 
         # Examples
         if self.example and self.example != self.node.parent.get('example'):
-            output += '\nExamples::\n\n'
-            output += tmt.utils.format(
-                '', self.example, wrap=False, indent=4,
-                key_color=None, value_color=None) + '\n'
+            examples = tmt.utils.listify(self.example)
+            first = True
+            for example in examples:
+                if first:
+                    output += '\nExamples::\n\n'
+                    first = False
+                else:
+                    output += '\n::\n\n'
+                output += tmt.utils.format(
+                    '', example, wrap=False, indent=4,
+                    key_color=None, value_color=None) + '\n'
 
         # Status
         if not self.node.children:
@@ -1089,7 +1276,7 @@ class Story(Core):
         Return whether the story is valid.
         """
         self.ls()
-        invalid_keys = self.lint_keys([])
+        invalid_keys = self.lint_keys(EXTRA_STORY_KEYS)
 
         if invalid_keys:
             for key in invalid_keys:
@@ -1117,7 +1304,7 @@ class Tree(tmt.utils.Common):
             return self._custom_context
         return super()._fmf_context()
 
-    def _filters_conditions(self, nodes, filters, conditions, links):
+    def _filters_conditions(self, nodes, filters, conditions, links, excludes):
         """ Apply filters and conditions, return pruned nodes """
         result = []
         for node in nodes:
@@ -1134,7 +1321,7 @@ class Tree(tmt.utils.Common):
                 if not all([fmf.utils.evaluate(condition, cond_vars, node)
                             for condition in conditions]):
                     continue
-            except fmf.utils.FilterError as error:
+            except fmf.utils.FilterError:
                 # Handle missing attributes as if condition failed
                 continue
             except Exception as error:
@@ -1145,7 +1332,7 @@ class Tree(tmt.utils.Common):
                 if not all([fmf.utils.filter(filter_, filter_vars, regexp=True)
                             for filter_ in filters]):
                     continue
-            except fmf.utils.FilterError as error:
+            except fmf.utils.FilterError:
                 # Handle missing attributes as if filter failed
                 continue
             # Links
@@ -1156,6 +1343,9 @@ class Tree(tmt.utils.Common):
                     continue
             except BaseException:
                 # Handle broken link as not matching
+                continue
+            # Exclude
+            if any([node for expr in excludes if re.search(expr, node.name)]):
                 continue
             result.append(node)
         return result
@@ -1186,7 +1376,7 @@ class Tree(tmt.utils.Common):
         return self.tree.root
 
     def tests(self, keys=None, names=None, filters=None, conditions=None,
-              unique=True, links=None):
+              unique=True, links=None, excludes=None):
         """ Search available tests """
         # Handle defaults, apply possible command line options
         keys = (keys or []) + ['test']
@@ -1194,32 +1384,42 @@ class Tree(tmt.utils.Common):
         filters = (filters or []) + list(Test._opt('filters', []))
         conditions = (conditions or []) + list(Test._opt('conditions', []))
         links = (links or []) + list(Test._opt('links', []))
+        excludes = (excludes or []) + list(Test._opt('exclude', []))
 
-        # First let's build the list of fmf nodes based on keys & names.
+        def name_filter(nodes):
+            """ Filter nodes based on names provided on the command line """
+            # Used in: tmt run test --name NAME, tmt test ls NAME...
+            names = list(Test._opt('names', []))
+            if not names:
+                return nodes
+            return [
+                node for node in nodes
+                if any([re.search(name, node.name) for name in names])]
+
+        # First let's build the list of test objects based on keys & names.
         # If duplicate test names are allowed, match test name/regexp
         # one-by-one and preserve the order of tests within a plan.
         if not unique and names:
-            nodes = []
+            tests = []
             for name in names:
-                nodes.extend(self.tree.prune(keys=keys, names=[name]))
+                selected_tests = [
+                    Test(test) for test
+                    in name_filter(self.tree.prune(keys=keys, names=[name]))]
+                tests.extend(
+                    sorted(selected_tests, key=lambda test: test.order))
         # Otherwise just perform a regular key/name filtering
         else:
-            nodes = self.tree.prune(keys=keys, names=names)
+            selected_tests = [
+                Test(test) for test
+                in name_filter(self.tree.prune(keys=keys, names=names))]
+            tests = sorted(selected_tests, key=lambda test: test.order)
 
-        # Apply possible additional name filters from the command line
-        # (Used in: tmt run test --name NAME, tmt test ls NAME...)
-        cli_names = list(Test._opt('names', []))
-        if cli_names:
-            nodes = [
-                node for node in nodes
-                if any([re.search(name, node.name) for name in cli_names])]
-
-        # Convert into Test objects and apply filters & conditions
+        # Apply filters & conditions
         return self._filters_conditions(
-            [Test(node) for node in nodes], filters, conditions, links)
+            tests, filters, conditions, links, excludes)
 
     def plans(self, keys=None, names=None, filters=None, conditions=None,
-              run=None, links=None):
+              run=None, links=None, excludes=None):
         """ Search available plans """
         # Handle defaults, apply possible command line options
         keys = (keys or []) + ['execute']
@@ -1227,15 +1427,18 @@ class Tree(tmt.utils.Common):
         filters = (filters or []) + list(Plan._opt('filters', []))
         conditions = (conditions or []) + list(Plan._opt('conditions', []))
         links = (links or []) + list(Plan._opt('links', []))
+        excludes = (excludes or []) + list(Plan._opt('exclude', []))
 
-        # Build the list and convert to objects
+        # Build the list, convert to objects, sort and filter
+        plans = [
+            Plan(plan, run=run) for plan
+            in self.tree.prune(keys=keys, names=names)]
         return self._filters_conditions(
-            [Plan(plan, run=run)
-                for plan in self.tree.prune(keys=keys, names=names)],
-            filters, conditions, links)
+            sorted(plans, key=lambda plan: plan.order),
+            filters, conditions, links, excludes)
 
     def stories(self, keys=None, names=None, filters=None, conditions=None,
-                whole=False, links=None):
+                whole=False, links=None, excludes=None):
         """ Search available stories """
         # Handle defaults, apply possible command line options
         keys = (keys or []) + ['story']
@@ -1243,12 +1446,15 @@ class Tree(tmt.utils.Common):
         filters = (filters or []) + list(Story._opt('filters', []))
         conditions = (conditions or []) + list(Story._opt('conditions', []))
         links = (links or []) + list(Story._opt('links', []))
+        excludes = (excludes or []) + list(Story._opt('exclude', []))
 
-        # Build the list and convert to objects
+        # Build the list, convert to objects, sort and filter
+        stories = [
+            Story(story) for story
+            in self.tree.prune(keys=keys, names=names, whole=whole)]
         return self._filters_conditions(
-            [Story(story) for story in self.tree.prune(
-                keys=keys, names=names, whole=whole)],
-            filters, conditions, links)
+            sorted(stories, key=lambda story: story.order),
+            filters, conditions, links, excludes)
 
     @staticmethod
     def init(path, template, force, **kwargs):
@@ -1333,7 +1539,7 @@ class Run(tmt.utils.Common):
         # The default discover method for this case is 'shell'
         default_plan['/plans/default']['discover']['how'] = 'shell'
         self.tree = tmt.Tree(tree=fmf.Tree(default_plan))
-        self.debug(f"No metadata found, using the default plan.")
+        self.debug("No metadata found, using the default plan.")
 
     def _save_tree(self, tree):
         """ Save metadata tree, handle the default plan """
@@ -1346,11 +1552,11 @@ class Run(tmt.utils.Common):
                 new_tree = fmf.Tree(default_plan)
                 new_tree.root = self.tree.root
                 self.tree.tree = new_tree
-                self.debug(f"Enforcing use of default plan")
+                self.debug("Enforcing use of default plan")
             # Insert default plan if no plan detected
             if not list(self.tree.tree.prune(keys=['execute'])):
                 self.tree.tree.update(default_plan)
-                self.debug(f"No plan found, adding the default plan.")
+                self.debug("No plan found, adding the default plan.")
         # Create an empty default plan if no fmf metadata found
         except tmt.utils.MetadataError:
             self._use_default_plan()
@@ -1363,7 +1569,7 @@ class Run(tmt.utils.Common):
             self._environment_from_options = dict()
             # Variables gathered from 'environment-file' options
             self._environment_from_options.update(
-                tmt.utils.environment_file_to_dict(
+                tmt.utils.environment_files_to_dict(
                     (self.opt('environment-file') or []),
                     root=self.tree.root))
             # Variables from 'environment' options (highest priority)
@@ -1494,6 +1700,9 @@ class Run(tmt.utils.Common):
         if self.opt('dry') or not interesting_results:
             return
 
+        # Return 0 if test execution has been intentionally skipped
+        if tmt.steps.execute.Execute._opt("dry"):
+            raise SystemExit(0)
         # Return appropriate exit code based on the total stats
         stats = Result.total(results)
         if sum(stats.values()) == 0:
@@ -1535,15 +1744,25 @@ class Run(tmt.utils.Common):
         # Create the workdir and save last run
         self._save_tree(self._tree)
         self._workdir_load(self._workdir_path)
+        if self.tree.root and self._workdir.startswith(self.tree.root):
+            raise tmt.utils.GeneralError(
+                "Run workdir must not be inside fmf root.")
         self.config.last_run(self.workdir)
         # Show run id / workdir path
         self.info(self.workdir, color='magenta')
         self.debug(f"tmt version: {tmt.__version__}")
         # Attempt to load run data
         self.load()
-
+        # Follow log instead of executing the run
         if self.opt('follow'):
             self.follow()
+
+        # Propagate dry mode from provision to prepare, execute and finish
+        # (basically nothing can be done if there is no guest provisioned)
+        if tmt.steps.provision.Provision._opt("dry"):
+            tmt.steps.prepare.Prepare._options["dry"] = True
+            tmt.steps.execute.Execute._options["dry"] = True
+            tmt.steps.finish.Finish._options["dry"] = True
 
         # Enable selected steps
         enabled_steps = self._context.obj.steps
@@ -1733,6 +1952,16 @@ class Status(tmt.utils.Common):
 class Clean(tmt.utils.Common):
     """ A class for cleaning up workdirs, guests or images """
 
+    def __init__(self, parent=None, name=None, workdir=None, context=None):
+        """
+        Initialize name and relation with the parent object
+
+        Always skip to initialize the work tree.
+        """
+        # Set the option to skip to initialize the work tree
+        context.params[tmt.utils.PLAN_SKIP_WORKTREE_INIT] = True
+        super().__init__(parent, name, workdir, context)
+
     def images(self):
         """ Clean images of provision plugins """
         self.info('images', color='blue')
@@ -1861,7 +2090,7 @@ class Result(object):
         'error': 'magenta',
         }
 
-    def __init__(self, data, name):
+    def __init__(self, data, name, interpret='respect'):
         """
         Initialize test result data """
 
@@ -1886,6 +2115,29 @@ class Result(object):
             self.log = tmt.utils.listify(data['log'])
         except KeyError:
             self.log = []
+
+        # Handle alternative result interpretation
+        if interpret != "respect":
+            # Extend existing note or set a new one
+            if self.note and isinstance(self.note, str):
+                self.note += f', original result: {self.result}'
+            elif self.note is None:
+                self.note = f'original result: {self.result}'
+            else:
+                raise tmt.utils.SpecificationError(
+                    f"Test result note '{self.note}' must be a string.")
+
+            if interpret == "xfail":
+                # Swap just fail<-->pass, keep the rest as is (info, warn,
+                # error)
+                self.result = {
+                    'fail': 'pass', 'pass': 'fail'}.get(
+                    self.result, self.result)
+            elif interpret in self._results:
+                self.result = interpret
+            else:
+                raise tmt.utils.SpecificationError(
+                    f"Invalid result '{interpret}' in test '{name}'.")
 
     @staticmethod
     def total(results):

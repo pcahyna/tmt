@@ -2,6 +2,7 @@
 """ Test Metadata Utilities """
 
 import contextlib
+import dataclasses
 import datetime
 import glob
 import io
@@ -11,19 +12,35 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import unicodedata
 from collections import OrderedDict
+from functools import lru_cache
 from pathlib import Path
 from threading import Thread
-from typing import Dict, Iterable
+from typing import (IO, TYPE_CHECKING, Any, Dict, Generator, Iterable, List,
+                    NamedTuple, Optional, Pattern, Tuple, Type, TypeVar, Union,
+                    cast, overload)
 
+import click
 import fmf
 import requests
+import requests.adapters
+import requests.packages.urllib3.util.retry
+import urllib3.exceptions
 from click import echo, style, wrap_text
-from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
 from ruamel.yaml import YAML, scalarstring
 from ruamel.yaml.comments import CommentedMap
+
+if sys.version_info >= (3, 8):
+    from typing import Literal, Protocol
+else:
+    from typing_extensions import Literal, Protocol
+
+
+if TYPE_CHECKING:
+    import tmt.base
+
 
 log = fmf.utils.Logging('tmt').logger
 
@@ -45,6 +62,7 @@ INDENT = 4
 # Default name and order for step plugins
 DEFAULT_NAME = 'default'
 DEFAULT_PLUGIN_ORDER = 50
+DEFAULT_PLUGIN_ORDER_MULTIHOST = 10
 DEFAULT_PLUGIN_ORDER_REQUIRES = 70
 DEFAULT_PLUGIN_ORDER_RECOMMENDS = 75
 
@@ -60,11 +78,115 @@ DEFAULT_SELECT_TIMEOUT = 5
 # Shell options to be set for all run shell scripts
 SHELL_OPTIONS = 'set -eo pipefail'
 
+# Defaults for HTTP/HTTPS retries and timeouts (see `retry_session()`).
+DEFAULT_RETRY_SESSION_RETRIES: int = 3
+DEFAULT_RETRY_SESSION_BACKOFF_FACTOR: float = 0.1
+
+# Defaults for HTTP/HTTPS retries for getting environment file
+# Retry with exponential backoff, maximum duration ~511 seconds
+ENVFILE_RETRY_SESSION_RETRIES: int = 10
+ENVFILE_RETRY_SESSION_BACKOFF_FACTOR: float = 1
+
+# A stand-in variable for generic use.
+T = TypeVar('T')
+
+# A FMF context type, representing name/values context.
+FmfContextType = Dict[str, List[str]]
+
+# A "environment" type, representing name/value environment variables.
+EnvironmentType = Dict[str, str]
+
+# Workdir argument type, can be True, a string, a path or None
+WorkdirArgumentType = Union[Literal[True], str, None]
+
+# Workdir type, can be None or a string
+WorkdirType = Optional[str]
+
+# Option to skip to initialize work tree in plan
+PLAN_SKIP_WORKTREE_INIT = 'plan_skip_worktree_init'
+
+
+class BaseLoggerFnType(Protocol):
+    def __call__(
+            self,
+            key: str,
+            value: Optional[str] = None,
+            color: Optional[str] = None,
+            shift: int = 0,
+            level: int = 1,
+            err: bool = False) -> None:
+        pass
+
+
+class LevelessLoggerFnType(Protocol):
+    def __call__(
+            self,
+            key: str,
+            value: Optional[str] = None,
+            color: Optional[str] = None,
+            shift: int = 0,
+            err: bool = False) -> None:
+        pass
+
+
+class SemanticLoggerFnType(Protocol):
+    def __call__(self, message: str, shift: int = 0) -> None:
+        pass
+
+
+LoggerFnType = Union[
+    BaseLoggerFnType,
+    LevelessLoggerFnType,
+    SemanticLoggerFnType]
+
+
+def indent(
+        key: str,
+        value: Optional[str] = None,
+        color: Optional[str] = None,
+        level: int = 0) -> str:
+    """
+    Indent a key/value message.
+
+    If both ``key`` and ``value`` are specified, ``{key}: {value}``
+    message is rendered. Otherwise, just ``key`` is used alone. If
+    ``value`` contains multiple lines, each but the very first line is
+    indented by one extra level.
+
+    :param value: optional value to print at right side of ``key``.
+    :param color: optional color to apply on ``key``.
+    :param level: number of indentation levels. Each level is indented
+                  by :py:data:`INDENT` spaces.
+    """
+
+    indent = ' ' * INDENT * level
+    deeper = ' ' * INDENT * (level + 1)
+
+    # Colorize
+    if color is not None:
+        key = style(key, fg=color)
+
+    # Handle key only
+    if value is None:
+        message = key
+
+    # Handle key + value
+    else:
+        # Multiline content indented deeper
+        if isinstance(value, str):
+            lines = value.splitlines()
+            if len(lines) > 1:
+                value = ''.join([f"\n{deeper}{line}" for line in lines])
+
+        message = f'{key}: {value}'
+
+    return indent + message
+
 
 class Config(object):
     """ User configuration """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """ Initialize config directory path """
         self.path = os.path.expanduser(CONFIG_PATH)
         if not os.path.exists(self.path):
@@ -74,7 +196,7 @@ class Config(object):
                 raise GeneralError(
                     f"Failed to create config '{self.path}'.\n{error}")
 
-    def last_run(self, run_id=None):
+    def last_run(self, run_id: Optional[str] = None) -> Optional[str]:
         """ Get and set last run id """
         symlink = os.path.join(self.path, 'last-run')
         if run_id:
@@ -101,16 +223,22 @@ class StreamLogger(Thread):
     https://github.com/packit/packit/blob/main/packit/utils/logging.py#L10
     """
 
-    def __init__(self, stream, log_header, logger):
+    def __init__(self,
+                 stream: Optional[IO[bytes]],
+                 log_header: str,
+                 logger: BaseLoggerFnType) -> None:
         super().__init__(daemon=True)
         self.stream = stream
-        self.output = []
+        self.output: List[str] = []
         self.log_header = log_header
         self.logger = logger
 
-    def run(self):
-        for line in self.stream:
-            line = line.decode('utf-8', errors='replace')
+    def run(self) -> None:
+        if self.stream is None:
+            return
+
+        for _line in self.stream:
+            line = _line.decode('utf-8', errors='replace')
             if line != '':
                 self.logger(
                     self.log_header,
@@ -119,7 +247,7 @@ class StreamLogger(Thread):
                     level=3)
             self.output.append(line)
 
-    def get_output(self):
+    def get_output(self) -> str:
         return "".join(self.output)
 
 
@@ -127,65 +255,100 @@ class StreamLogger(Thread):
 #  Common
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+CommonDerivedType = TypeVar('CommonDerivedType', bound='Common')
+
+
+class CommandOutput(NamedTuple):
+    stdout: Optional[str]
+    stderr: Optional[str]
+
+
 class Common(object):
     """
     Common shared stuff
 
-    Takes care of command line context and workdir handling.
+    Takes care of command line context, options and workdir handling.
     Provides logging functions info(), verbose() and debug().
     Implements read() and write() for comfortable file access.
     Provides the run() method for easy command execution.
     """
 
-    # Command line context and workdir
-    _context = None
-    _workdir = None
+    # Command line context, options and workdir
+    _context: Optional[click.Context] = None
+    # When set to true, _opt will be ignored (default will be returned)
+    ignore_class_options: bool = False
+    _options: Dict[str, Any] = dict()
+    _workdir: WorkdirType = None
 
-    def __init__(self, parent=None, name=None, workdir=None, context=None):
+    def __init__(
+            self,
+            parent: Optional[CommonDerivedType] = None,
+            name: Optional[str] = None,
+            workdir: WorkdirArgumentType = None,
+            context: Optional[click.Context] = None,
+            relative_indent: int = 1):
         """
         Initialize name and relation with the parent object
 
         Prepare the workdir for provided id / directory path
         or generate a new workdir name if workdir=True given.
-        Store command line context for future use if provided.
+        Store command line context and options for future use
+        if context is provided.
         """
         # Use lowercase class name as the default name
         self.name = name or self.__class__.__name__.lower()
         self.parent = parent
 
+        # Relative log indent level shift against the parent
+        self._relative_indent = relative_indent
+
         # Store command line context
         if context:
-            self._context = context
+            self._save_context(context)
 
         # Initialize the workdir if requested
         self._workdir_load(workdir)
 
-    def __str__(self):
+    def __str__(self) -> str:
         """ Name is the default string representation """
         return self.name
 
     @classmethod
-    def _save_context(cls, context):
-        """ Save provided command line context for future use """
+    def _save_context(cls, context: click.Context) -> None:
+        """ Save provided command line context and options for future use """
         cls._context = context
+        cls._options = context.params
+
+    @overload
+    @classmethod
+    def _opt(cls, option: str) -> Any:
+        pass
+
+    @overload
+    @classmethod
+    def _opt(cls, option: str, default: T) -> T:
+        pass
 
     @classmethod
-    def _opt(cls, option, default=None):
+    def _opt(cls, option: str, default: Any = None) -> Any:
         """ Get an option from the command line context (class version) """
-        if cls._context is None:
+        if cls.ignore_class_options:
             return default
-        return cls._context.params.get(option, default)
+        return cls._options.get(option, default)
 
-    def _fmf_context(self):
-        """ Return the current fmf contex """
+    def _fmf_context(self) -> FmfContextType:
+        """ Return the current fmf context """
+        if self._context is None:
+            return dict()
+
         try:
-            return self._context.obj.fmf_context
+            return cast(FmfContextType, self._context.obj.fmf_context)
         except AttributeError:
             return dict()
 
-    def opt(self, option, default=None):
+    def opt(self, option: str, default: Optional[Any] = None) -> Any:
         """
-        Get an option from the command line context
+        Get an option from the command line options
 
         Checks also parent options. For flags (boolean values) parent's
         True wins over child's False (e.g. run --quiet enables quiet
@@ -211,10 +374,8 @@ class Common(object):
             except KeyError:
                 pass
 
-        # Check local option
-        local = default
-        if self._context is not None:
-            local = self._context.params.get(option, default)
+        # Get local option
+        local = self._options.get(option, default)
         # Check parent option
         parent = None
         if self.parent:
@@ -232,35 +393,28 @@ class Common(object):
         else:
             return parent if parent is not None else local
 
-    def _level(self):
+    def _level(self) -> int:
         """ Hierarchy level """
         if self.parent is None:
             return -1
         else:
-            return self.parent._level() + 1
+            return self.parent._level() + self._relative_indent
 
-    def _indent(self, key, value=None, color=None, shift=0):
+    def _indent(
+            self,
+            key: str,
+            value: Optional[str] = None,
+            color: Optional[str] = None,
+            shift: int = 0) -> str:
         """ Indent message according to the object hierarchy """
-        level = self._level() + shift
-        indent = ' ' * INDENT * level
-        deeper = ' ' * INDENT * (level + 1)
-        # Colorize
-        if color is not None:
-            key = style(key, fg=color)
-        # Handle key only
-        if value is None:
-            message = key
-        # Handle key + value
-        else:
-            # Multiline content indented deeper
-            if isinstance(value, str):
-                lines = value.splitlines()
-                if len(lines) > 1:
-                    value = ''.join([f"\n{deeper}{line}" for line in lines])
-            message = f'{key}: {value}'
-        return indent + message
 
-    def _log(self, message):
+        return indent(
+            key,
+            value=value,
+            color=color,
+            level=self._level() + shift)
+
+    def _log(self, message: str) -> None:
         """ Append provided message to the current log """
         # Nothing to do if there is no workdir
         if self.workdir is None:
@@ -274,41 +428,80 @@ class Common(object):
                 log.write(datetime.datetime.utcnow().strftime('%H:%M:%S') + ' '
                           + remove_color(message) + '\n')
 
-    def print(self, key, value=None, color=None, shift=0, err=False):
+    def print(
+            self,
+            key: str,
+            value: Optional[str] = None,
+            color: Optional[str] = None,
+            shift: int = 0,
+            err: bool = False) -> None:
         """ Print a message regardless the quiet mode """
         self._log(self._indent(key, value, color=None, shift=shift))
         echo(self._indent(key, value, color, shift), err=err)
 
-    def info(self, key, value=None, color=None, shift=0, err=False):
+    def info(
+            self,
+            key: str,
+            value: Optional[str] = None,
+            color: Optional[str] = None,
+            shift: int = 0,
+            err: bool = False) -> None:
         """ Show a message unless in quiet mode """
         self._log(self._indent(key, value, color=None, shift=shift))
         if not self.opt('quiet'):
             echo(self._indent(key, value, color, shift), err=err)
 
-    def warn(self, message, shift=0):
+    def verbose(
+            self,
+            key: str,
+            value: Optional[str] = None,
+            color: Optional[str] = None,
+            shift: int = 0,
+            level: int = 1,
+            err: bool = False) -> None:
+        """
+        Show message if in requested verbose mode level
+
+        In quiet mode verbose messages are not displayed.
+        """
+        self._log(self._indent(key, value, color=None, shift=shift))
+        if not self.opt('quiet') and self.opt('verbose') >= level:
+            echo(self._indent(key, value, color, shift), err=err)
+
+    def debug(
+            self,
+            key: str,
+            value: Optional[str] = None,
+            color: Optional[str] = None,
+            shift: int = 0,
+            level: int = 1,
+            err: bool = False) -> None:
+        """
+        Show message if in requested debug mode level
+
+        In quiet mode debug messages are not displayed.
+        """
+        self._log(self._indent(key, value, color=None, shift=shift))
+        if not self.opt('quiet') and self.opt('debug') >= level:
+            echo(self._indent(key, value, color, shift), err=err)
+
+    def warn(self, message: str, shift: int = 0) -> None:
         """ Show a yellow warning message on info level, send to stderr """
         self.info('warn', message, color='yellow', shift=shift, err=True)
 
-    def fail(self, message, shift=0):
+    def fail(self, message: str, shift: int = 0) -> None:
         """ Show a red failure message on info level, send to stderr """
         self.info('fail', message, color='red', shift=shift, err=True)
 
-    def verbose(
-            self, key, value=None, color=None, shift=0, level=1, err=False):
-        """ Show message if in requested verbose mode level """
-        self._log(self._indent(key, value, color=None, shift=shift))
-        if self.opt('verbose') >= level:
-            echo(self._indent(key, value, color, shift), err=err)
-
-    def debug(self, key, value=None, color=None, shift=1, level=1, err=False):
-        """ Show message if in requested debug mode level """
-        self._log(self._indent(key, value, color=None, shift=shift))
-        if self.opt('debug') >= level:
-            echo(self._indent(key, value, color, shift), err=err)
-
-    def _run(
-            self, command, cwd, shell, env, log, join=False, interactive=False,
-            timeout=None):
+    def _run(self,
+             command: Union[str, List[str]],
+             cwd: Optional[str],
+             shell: bool,
+             env: Optional[EnvironmentType],
+             log: Optional[BaseLoggerFnType],
+             join: bool = False,
+             interactive: bool = False,
+             timeout: Optional[int] = None) -> CommandOutput:
         """
         Run command, capture the output
 
@@ -335,12 +528,12 @@ class Common(object):
             try:
                 subprocess.run(
                     command, cwd=cwd, shell=shell, env=environment, check=True)
-            except subprocess.CalledProcessError as error:
+            except subprocess.CalledProcessError:
                 # Interactive mode can return non-zero if the last command
                 # failed, ignore errors here
                 pass
             finally:
-                return None if join else (None, None)
+                return CommandOutput(None, None)
 
         # Create the process
         try:
@@ -372,20 +565,30 @@ class Common(object):
 
         # Handle the exit code, return output
         if process.returncode != 0:
-            if isinstance(command, (list, tuple)):
-                command = ' '.join(command)
             raise RunError(
                 message=f"Command returned '{process.returncode}'.",
                 command=command,
                 returncode=process.returncode,
                 stdout=stdout_thread.get_output(),
                 stderr=stderr_thread.get_output())
-        return stdout_thread.get_output() if join else (
-            stdout_thread.get_output(), stderr_thread.get_output())
+        if join:
+            return CommandOutput(
+                stdout_thread.get_output(), None)
+        else:
+            return CommandOutput(
+                stdout_thread.get_output(), stderr_thread.get_output())
 
-    def run(
-            self, command, message=None, cwd=None, dry=False, shell=True,
-            env=None, interactive=False, join=False, log=None, timeout=None):
+    def run(self,
+            command: Union[str, List[str]],
+            message: Optional[str] = None,
+            cwd: Optional[str] = None,
+            dry: bool = False,
+            shell: bool = False,
+            env: Optional[EnvironmentType] = None,
+            interactive: bool = False,
+            join: bool = False,
+            log: Optional[BaseLoggerFnType] = None,
+            timeout: Optional[int] = None) -> CommandOutput:
         """
         Run command, give message, handle errors
 
@@ -395,6 +598,7 @@ class Common(object):
         Output is logged using self.debug() or custom 'log' function.
         Returns stdout if join=True, (stdout, stderr) tuple otherwise.
         """
+
         # Use a generic message if none given, prepare error message
         if not message:
             if isinstance(command, (list, tuple)):
@@ -407,13 +611,13 @@ class Common(object):
 
         # Nothing more to do in dry mode (unless requested)
         if self.opt('dry') and not dry:
-            return None if join else (None, None)
+            return CommandOutput(None, None)
 
         # Run the command, handle the exit code
         cwd = cwd or self.workdir
 
         # Fail nicely if the working directory does not exist
-        if not os.path.exists(cwd):
+        if cwd and not os.path.exists(cwd):
             raise GeneralError(
                 f"The working directory '{cwd}' does not exist.")
 
@@ -427,7 +631,7 @@ class Common(object):
                 message, error.command, error.returncode,
                 error.stdout, error.stderr)
 
-    def read(self, path, level=2):
+    def read(self, path: str, level: int = 2) -> str:
         """ Read a file from the workdir """
         if self.workdir:
             path = os.path.join(self.workdir, path)
@@ -438,7 +642,12 @@ class Common(object):
         except OSError as error:
             raise FileError(f"Failed to read '{path}'.\n{error}")
 
-    def write(self, path, data, mode='w', level=2):
+    def write(
+            self,
+            path: str,
+            data: Any,
+            mode: str = 'w',
+            level: int = 2) -> None:
         """ Write a file to the workdir """
         if self.workdir:
             path = os.path.join(self.workdir, path)
@@ -449,11 +658,11 @@ class Common(object):
             return
         try:
             with open(path, mode, encoding='utf-8', errors='replace') as file:
-                return file.write(data)
+                file.write(data)
         except OSError as error:
             raise FileError(f"Failed to write '{path}'.\n{error}")
 
-    def _workdir_init(self, id_=None):
+    def _workdir_init(self, id_: WorkdirArgumentType = None) -> None:
         """
         Initialize the work directory
 
@@ -471,12 +680,12 @@ class Common(object):
                 workdir = os.path.join(WORKDIR_ROOT, id_)
         # Generate a unique workdir name
         elif id_ is None:
-            for id_ in range(1, WORKDIR_MAX + 1):
-                directory = 'run-{}'.format(str(id_).rjust(3, '0'))
+            for id_bit in range(1, WORKDIR_MAX + 1):
+                directory = 'run-{}'.format(str(id_bit).rjust(3, '0'))
                 workdir = os.path.join(WORKDIR_ROOT, directory)
                 if not os.path.exists(workdir):
                     break
-            if id_ == WORKDIR_MAX:
+            else:
                 raise GeneralError(
                     f"Workdir full. Cleanup the '{WORKDIR_ROOT}' directory.")
         # Weird workdir id
@@ -489,10 +698,17 @@ class Common(object):
             self._workdir_cleanup(workdir)
 
         # Create the workdir
+        # Make sure WORKDIR_ROOT has 1777 permission if recreated
+        if workdir.startswith(WORKDIR_ROOT) and not os.path.isdir(WORKDIR_ROOT):
+            try:
+                os.makedirs(WORKDIR_ROOT, exist_ok=True)
+                os.chmod(WORKDIR_ROOT, 0o1777)
+            except OSError as error:
+                raise FileError(f"Failed to prepare workdir '{WORKDIR_ROOT}': {error}")
         create_directory(workdir, 'workdir', quiet=True)
         self._workdir = workdir
 
-    def _workdir_name(self):
+    def _workdir_name(self) -> Optional[str]:
         """ Construct work directory name from parent workdir """
         # Need the parent workdir
         if self.parent is None or self.parent.workdir is None:
@@ -500,7 +716,7 @@ class Common(object):
         # Join parent name with self
         return os.path.join(self.parent.workdir, self.name.lstrip('/'))
 
-    def _workdir_load(self, workdir):
+    def _workdir_load(self, workdir: WorkdirArgumentType) -> None:
         """
         Create the given workdir if it is not None
 
@@ -511,16 +727,17 @@ class Common(object):
         elif workdir is not None:
             self._workdir_init(workdir)
 
-    def _workdir_cleanup(self, path=None):
+    def _workdir_cleanup(self, path: Optional[str] = None) -> None:
         """ Clean up the work directory """
         directory = path or self._workdir_name()
-        if os.path.isdir(directory):
-            self.debug(f"Clean up workdir '{directory}'.", level=2)
-            shutil.rmtree(directory)
+        if directory is not None:
+            if os.path.isdir(directory):
+                self.debug(f"Clean up workdir '{directory}'.", level=2)
+                shutil.rmtree(directory)
         self._workdir = None
 
     @property
-    def workdir(self):
+    def workdir(self) -> Optional[str]:
         """ Get the workdir, create if does not exist """
         if self._workdir is None:
             self._workdir = self._workdir_name()
@@ -531,17 +748,21 @@ class Common(object):
             create_directory(self._workdir, 'workdir', quiet=True)
         return self._workdir
 
-
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #  Exceptions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+
 class GeneralError(Exception):
     """ General error """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Store the original exception for future use
         self.original = kwargs.get('original')
+
+
+class GitUrlError(GeneralError):
+    """ Remote git url is not reachable """
 
 
 class FileError(GeneralError):
@@ -552,8 +773,14 @@ class RunError(GeneralError):
     """ Command execution error """
 
     def __init__(
-            self, message, command, returncode,
-            stdout=None, stderr=None, *args, **kwargs):
+            self,
+            message: str,
+            command: Union[str, List[str]],
+            returncode: int,
+            stdout: Optional[str] = None,
+            stderr: Optional[str] = None,
+            *args: Any,
+            **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.message = message
         self.command = command
@@ -579,6 +806,7 @@ class StructuredFieldError(GeneralError):
 
 
 # Step exceptions
+
 
 class DiscoverError(GeneralError):
     """ Discover step error """
@@ -608,23 +836,22 @@ class FinishError(GeneralError):
 #  Utilities
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-def quote(string):
+def quote(string: str) -> str:
     """ Surround a string with double quotes """
     return f'"{string}"'
 
 
-def ascii(text):
+def ascii(text: Any) -> bytes:
     """ Transliterate special unicode characters into pure ascii """
-    try:
-        if not isinstance(text, unicode):
-            text = unicode(text)
-    except NameError:
-        if not isinstance(text, str):
-            text = str(text)
+    if not isinstance(text, str):
+        text = str(text)
     return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore')
 
 
-def listify(data, split=False, keys=None):
+def listify(
+        data: Union[Tuple[Any, ...], List[Any], str, Dict[Any, Any]],
+        split: bool = False,
+        keys: Optional[List[str]] = None) -> Union[List[Any], Dict[Any, Any]]:
     """
     Ensure that variable is a list, convert if necessary
 
@@ -646,9 +873,47 @@ def listify(data, split=False, keys=None):
     return [data]
 
 
+def copytree(
+        src: str,
+        dst: str,
+        symlinks: bool = False,
+        dirs_exist_ok: bool = False,
+        ) -> Any:
+    """ Similar to shutil.copytree but with dirs_exist_ok for Python < 3.8 """
+    # No need to reimplement for newer python or if argument is not requested
+    if not dirs_exist_ok or sys.version_info >= (3, 8):
+        return shutil.copytree(
+            src=src, dst=dst, symlinks=symlinks, dirs_exist_ok=dirs_exist_ok)
+    # Choice was to either copy python implementation and change ONE line
+    # or use rsync (or cp with shell)
+    # We need to copy CONTENT of src into dst
+    # so src has to end with / and dst cannot
+    if src[-1] != '/':
+        src += '/'
+    if dst[-1] == '/':
+        dst = dst[:-1]
+
+    command = ["rsync", "-r"]
+    if symlinks:
+        command.append('-l')
+    command.extend([src, dst])
+
+    log.debug(f"Calling command '{command}'.")
+    outcome = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, universal_newlines=True)
+
+    if outcome.returncode != 0:
+        raise shutil.Error(
+            [f"Unable to copy '{src}' into '{dst}' using rsync.",
+             outcome.returncode, outcome.stdout])
+    return dst
+
+
 # These two are helpers for shell_to_dict and environment_to_dict -
 # there is some overlap of their functionality.
-def _add_simple_var(result, var):
+def _add_simple_var(result: EnvironmentType, var: str) -> None:
     """
     Add a single NAME=VALUE pair into result dictionary
 
@@ -663,7 +928,7 @@ def _add_simple_var(result, var):
     result[name] = value
 
 
-def _add_file_vars(result, filepath):
+def _add_file_vars(result: EnvironmentType, filepath: str) -> None:
     """
     Add variables loaded from file into the result dictionary
 
@@ -676,21 +941,22 @@ def _add_file_vars(result, filepath):
             f"Invalid variable file specification '{filepath}'.")
 
     try:
-        with open(filepath[1:], 'r') as content:
+        with open(filepath[1:], 'r') as file:
+            # Handle empty file as an empty environment
+            content = file.read()
+            if not content:
+                log.warn(f"Empty environment file '{filepath}'.")
+                return
             file_vars = yaml_to_dict(content)
     except Exception as exception:
         raise GeneralError(
             f"Failed to load variables from '{filepath}': {exception}")
 
-    # Handle empty file as an empty environment
-    if file_vars is None:
-        log.warn(f"Empty environment file '{filepath}'.")
-        return
     for name, value in file_vars.items():
         result[name] = str(value)
 
 
-def shell_to_dict(variables):
+def shell_to_dict(variables: Union[str, List[str]]) -> EnvironmentType:
     """
     Convert shell-like variables into a dictionary
 
@@ -703,7 +969,7 @@ def shell_to_dict(variables):
     """
     if not isinstance(variables, (list, tuple)):
         variables = [variables]
-    result = dict()
+    result: EnvironmentType = dict()
     for variable in variables:
         if variable is None:
             continue
@@ -713,7 +979,7 @@ def shell_to_dict(variables):
     return result
 
 
-def environment_to_dict(variables):
+def environment_to_dict(variables: Union[str, List[str]]) -> EnvironmentType:
     """
     Convert environment variables into a dictionary
 
@@ -739,7 +1005,7 @@ def environment_to_dict(variables):
 
     if not isinstance(variables, (list, tuple)):
         variables = [variables]
-    result = dict()
+    result: EnvironmentType = dict()
 
     for variable in variables:
         if variable is None:
@@ -753,73 +1019,136 @@ def environment_to_dict(variables):
     return result
 
 
-def environment_file_to_dict(
-        env_files: Iterable[str], root=".") -> Dict[str, str]:
+@lru_cache(maxsize=None)
+def environment_file_to_dict(env_file: str, root: str = ".") -> EnvironmentType:
     """
-    Create dict from files.
+    Read environment variables from the given file.
 
-    Files should be in yaml/yml or dotenv format.
+    File should be in YAML format (``.yaml`` or ``.yml`` suffixes), or in dotenv format.
 
-    dotenv file example:
-        ```bash
-        A=B
-        C=D
-        ```
-    yaml file example:
-        ```yaml
-        A: B
-        C: D
-        ```
+    .. code-block:: bash
+       :caption: dotenv file example
 
-    Path to the file should be relative to the metadata tree root.
+       A=B
+       C=D
+
+    .. code-block:: yaml
+       :caption: YAML file example
+
+       A: B
+       C: D
+
+    Path to each file should be relative to the metadata tree root.
+
+    .. note::
+
+       For loading environment variables from multiple files, see
+       :py:func:`environment_files_to_dict`.
     """
-    result = {}
+
+    env_file = env_file.strip()
+
+    # Fetch a remote file
+    if env_file.startswith("http"):
+        # Create retry session for longer retries, see #1229
+        session = retry_session.create(
+            retries=ENVFILE_RETRY_SESSION_RETRIES,
+            backoff_factor=ENVFILE_RETRY_SESSION_BACKOFF_FACTOR,
+            allowed_methods=('GET',),
+            status_forcelist=(
+                429,  # Too Many Requests
+                500,  # Internal Server Error
+                502,  # Bad Gateway
+                503,  # Service Unavailable
+                504   # Gateway Timeout
+                ),
+            )
+        try:
+            response = session.get(env_file)
+            response.raise_for_status()
+            content = response.text
+        except requests.RequestException as error:
+            raise GeneralError(
+                f"Failed to fetch the environment file from '{env_file}'. "
+                f"The problem was: '{error}'")
+
+    # Read a local file
+    else:
+        # Ensure we don't escape from the metadata tree root
+        try:
+            root_path = Path(root).resolve()
+            full_path = (Path(root_path) / Path(env_file)).resolve()
+            full_path.relative_to(root_path)
+        except ValueError:
+            raise GeneralError(
+                f"The 'environment-file' path '{full_path}' is outside "
+                f"of the metadata tree root '{root}'.")
+        if not Path(full_path).is_file():
+            raise GeneralError(f"File '{full_path}' doesn't exist.")
+
+        content = Path(full_path).read_text()
+
+    # Parse yaml file
+    if os.path.splitext(env_file)[1].lower() in ('.yaml', '.yml'):
+        environment = parse_yaml(content)
+
+    else:
+        try:
+            environment = parse_dotenv(content)
+
+        except ValueError:
+            raise GeneralError(
+                f"Failed to extract variables from environment file "
+                f"'{full_path}'. Ensure it has the proper format "
+                f"(i.e. A=B).")
+
+    if not environment:
+        log.warn(f"Empty environment file '{env_file}'.")
+
+        return {}
+
+    return environment
+
+
+def environment_files_to_dict(env_files: Iterable[str], root: str = ".") -> EnvironmentType:
+    """
+    Read environment variables from the given list of files.
+
+    Files should be in YAML format (``.yaml`` or ``.yml`` suffixes), or in dotenv format.
+
+    .. code-block:: bash
+       :caption: dotenv file example
+
+       A=B
+       C=D
+
+    .. code-block:: yaml
+       :caption: YAML file example
+
+       A: B
+       C: D
+
+    Path to each file should be relative to the metadata tree root.
+
+    .. note::
+
+       For loading environment variables from a single file, see
+       :py:func:`environment_file_to_dict`, which is a function
+       ``environment_files_to_dict()`` calls for each file,
+       accumulating data from all input files.
+    """
+
+    result: EnvironmentType = {}
+
     for env_file in env_files:
-        env_file = str(env_file).strip()
-        # Fetch a remote file
-        if env_file.startswith("http"):
-            try:
-                response = requests.get(env_file)
-                response.raise_for_status()
-                content = response.text
-            except requests.RequestException as error:
-                raise GeneralError(
-                    f"Failed to fetch the environment file from '{env_file}'. "
-                    f"The problem was: '{error}'")
-        # Read a local file
-        else:
-            # Ensure we don't escape from the metadata tree root
-            try:
-                root = Path(root).resolve()
-                full_path = (Path(root) / Path(env_file)).resolve()
-                full_path.relative_to(root)
-            except ValueError:
-                raise GeneralError(
-                    f"The 'environment-file' path '{full_path}' is outside "
-                    f"of the metadata tree root '{root}'.")
-            if not Path(full_path).is_file():
-                raise GeneralError(f"File '{full_path}' doesn't exist.")
-            content = Path(full_path).read_text()
-        # Parse yaml file
-        if re.match(r".*\.ya?ml$", env_file):
-            environment = parse_yaml(content)
-            if not environment:
-                log.warn(f"Empty environment file '{env_file}'.")
-            result.update(environment)
-        # Parse dotenv file
-        else:
-            try:
-                result.update(parse_dotenv(content))
-            except ValueError:
-                raise GeneralError(
-                    f"Failed to extract variables from environment file "
-                    f"'{full_path}'. Ensure it has the proper format "
-                    f"(i.e. A=B).")
+        result.update(environment_file_to_dict(env_file, root=root))
+
     return result
 
 
 @contextlib.contextmanager
-def modify_environ(new_elements):
+def modify_environ(
+        new_elements: EnvironmentType) -> Generator[None, None, None]:
     """ A context manager for os.environ that restores the initial state """
     environ_backup = os.environ.copy()
     os.environ.clear()
@@ -831,7 +1160,7 @@ def modify_environ(new_elements):
         os.environ.update(environ_backup)
 
 
-def context_to_dict(context):
+def context_to_dict(context: List[str]) -> FmfContextType:
     """
     Convert command line context definition into a dictionary
 
@@ -846,7 +1175,11 @@ def context_to_dict(context):
         for key, value in environment_to_dict(context).items()}
 
 
-def dict_to_yaml(data, width=None, sort=False, start=False):
+def dict_to_yaml(
+        data: Union[Dict[str, Any], List[Any]],
+        width: Optional[int] = None,
+        sort: bool = False,
+        start: bool = False) -> str:
     """ Convert dictionary into yaml """
     output = io.StringIO()
     yaml = YAML()
@@ -868,26 +1201,182 @@ def dict_to_yaml(data, width=None, sort=False, start=False):
     return output.getvalue()
 
 
-def yaml_to_dict(data, check_version=False, yaml_type=None):
+YamlTypType = Literal['rt', 'safe', 'unsafe', 'base']
+
+
+def yaml_to_dict(data: Any,
+                 yaml_type: Optional[YamlTypType] = None) -> Dict[Any, Any]:
+    """ Convert yaml into dictionary """
+    yaml = YAML(typ=yaml_type)
+    loaded_data = yaml.load(data)
+    if loaded_data is None:
+        return dict()
+    if not isinstance(loaded_data, dict):
+        raise GeneralError(
+            f"Expected dictionary in yaml data, "
+            f"got '{type(loaded_data).__name__}'.")
+    return loaded_data
+
+
+SerializableContainerDerivedType = TypeVar(
+    'SerializableContainerDerivedType',
+    bound='SerializableContainer')
+
+
+@dataclasses.dataclass
+class SerializableContainer:
     """
-    Convert yaml into dictionary
-
-    The check_version argument is used to load the YAML in both YAML
-    versions (1.1 and 1.2) and see if the results equal. This is useful
-    for smooth deprecation of YAML 1.1.
+    A mixin class for objects that may be saved in files and restored later
     """
-    # FIXME: Deprecate the 1.1 loading in 2.0
-    old_yaml = YAML(typ=yaml_type)
-    old_yaml.version = (1, 1)
-    old_result = old_yaml.load(data)
-    if check_version:
-        yaml = YAML()
-        result = yaml.load(data)
-        return old_result == result, old_result
-    return old_result
+
+    def to_dict(self) -> Dict[str, Any]:
+        """ Return keys and values in the form of a dictionary """
+
+        return dataclasses.asdict(self)
+
+    # This method should remain a class-method: 1. list of keys is known
+    # already, therefore it's not necessary to create an instance, and
+    # 2. some functionality makes use of this knowledge.
+    @classmethod
+    def keys(cls) -> Generator[str, None, None]:
+        """ Iterate over key names """
+
+        for field in dataclasses.fields(cls):
+            yield field.name
+
+    def values(self) -> Generator[Any, None, None]:
+        """ Iterate over key values """
+
+        yield from self.to_dict().values()
+
+    def items(self) -> Generator[Tuple[str, Any], None, None]:
+        """ Iterate over key/value pairs """
+
+        yield from self.to_dict().items()
+
+    #
+    # Moving data between containers and objects owning them
+    #
+
+    def inject_to(self, obj: Any) -> None:
+        """
+        Inject keys from this container into attributes of a given object
+        """
+
+        for name, value in self.items():
+            setattr(obj, name, value)
+
+    @classmethod
+    def extract_from(cls: Type[SerializableContainerDerivedType],
+                     obj: Any) -> SerializableContainerDerivedType:
+        """ Extract keys from given object, and save them in a container """
+
+        data = cls()
+
+        for key in cls.keys():
+            value = getattr(obj, key)
+            if value is not None:
+                setattr(data, key, value)
+
+        return data
+
+    #
+    # Serialization - writing containers into YAML files, and restoring
+    # them later.
+    #
+
+    def to_serialized(self) -> Dict[str, Any]:
+        """
+        Return keys and values in the form allowing later reconstruction.
+
+        Used to transform container into a structure one can save in a
+        YAML file, and restore it later.
+
+        See :py:meth:`from_serialized` for its counterpart.
+        """
+
+        fields = self.to_dict()
+
+        # Add a special field tracking what class we just shattered to pieces.
+        fields.update({
+            '__class__': {
+                'module': self.__class__.__module__,
+                'name': self.__class__.__name__
+                }
+            })
+
+        return fields
+
+    @classmethod
+    def from_serialized(
+            cls: Type[SerializableContainerDerivedType],
+            serialized: Dict[str, Any]) -> SerializableContainerDerivedType:
+        """
+        Recreate container from its serialized form.
+
+        Used to transform data read from a YAML file into the original
+        container.
+
+        See :py:meth:`to_serialized` for its counterpart.
+        """
+
+        # Our special key may or may not be present, depending on who
+        # calls this method.  In any case, it is not needed, because we
+        # already know what class to restore: this one.
+        serialized.pop('__class__', None)
+
+        return cls(**serialized)
+
+    @staticmethod
+    def unserialize(serialized: Dict[str, Any]
+                    ) -> SerializableContainerDerivedType:
+        """
+        Recreate container from its serialized form.
+
+        Similar to :py:meth:`from_serialized`, but this method knows
+        nothing about container's class, and will locate the correct
+        module and class by inspecting serialized data. Discovered
+        class' :py:meth:`from_serialized` is then used to create the
+        container.
+
+        Used to transform data read from a YAML file into original
+        containers when their classes are not know to the code.
+        Restoring such containers requires inspection of serialized data
+        and dynamic imports of modules as needed.
+        """
+
+        from tmt.plugins import import_
+
+        # Unpack class info, to get nicer variable names
+        klass_info = serialized.pop('__class__')
+        klass_module_name = klass_info['module']
+        klass_name = klass_info['name']
+
+        # Make sure the module is imported. It probably is, but really,
+        # make sure of it.
+        import_(klass_module_name)
+
+        # Now the module should be available in `sys.modules` like any
+        # other, and we can go and grab the class we need from it.
+        klass_module = sys.modules[klass_module_name]
+        klass = getattr(klass_module, klass_name)
+
+        if klass is None:
+            raise SystemExit(
+                f"Failed to import '{klass_name}' "
+                f"from '{klass_module_name}' module.")
+
+        # Stay away from classes that are not derived from this one, to
+        # honor promise given by return value annotation.
+        assert issubclass(klass, SerializableContainer)
+
+        # Apparently, the issubclass() check above is not good enough for mypy.
+        return cast(
+            SerializableContainerDerivedType,
+            klass.from_serialized(serialized))
 
 
-def markdown_to_html(filename):
+def markdown_to_html(filename: str) -> str:
     """
     Convert markdown to html
 
@@ -901,13 +1390,17 @@ def markdown_to_html(filename):
 
     try:
         with open(filename, 'r') as file:
-            text = file.read()
+            try:
+                text = file.read()
+            except UnicodeError:
+                raise MetadataError(f"Unable to read '{filename}'.")
             return markdown.markdown(text)
     except IOError:
         raise ConvertError(f"Unable to open '{filename}'.")
 
 
-def shell_variables(data):
+def shell_variables(
+        data: Union[List[str], Tuple[str, ...], Dict[str, Any]]) -> List[str]:
     """
     Prepare variables to be consumed by shell
 
@@ -929,7 +1422,7 @@ def shell_variables(data):
     return [f"{key}={shlex.quote(str(value))}" for key, value in data.items()]
 
 
-def duration_to_seconds(duration):
+def duration_to_seconds(duration: str) -> int:
     """ Convert sleep time format into seconds """
     units = {
         's': 1,
@@ -938,15 +1431,22 @@ def duration_to_seconds(duration):
         'd': 60 * 60 * 24,
         }
     try:
-        number, suffix = re.match(r'^(\d+)([smhd]?)$', str(duration)).groups()
+        match = re.match(r'^(\d+)([smhd]?)$', str(duration))
+        if match is None:
+            raise SpecificationError(f"Invalid duration '{duration}'.")
+        number, suffix = match.groups()
         return int(number) * units.get(suffix, 1)
     except (ValueError, AttributeError):
         raise SpecificationError(f"Invalid duration '{duration}'.")
 
 
 def verdict(
-        decision, comment=None, good='pass', bad='fail', problem='warn',
-        **kwargs):
+        decision: Optional[bool],
+        comment: Optional[str] = None,
+        good: str = 'pass',
+        bad: str = 'fail',
+        problem: str = 'warn',
+        **kwargs: Any) -> Optional[bool]:
     """
     Print verdict in green, red or yellow based on the decision
 
@@ -976,9 +1476,13 @@ def verdict(
 
 
 def format(
-        key, value=None,
-        indent=12, width=72, wrap='auto',
-        key_color='green', value_color='black'):
+        key: str,
+        value: Union[None, str, List[Any], Dict[Any, Any]] = None,
+        indent: int = 12,
+        width: int = 72,
+        wrap: Literal[True, False, 'auto'] = 'auto',
+        key_color: str = 'green',
+        value_color: str = 'black') -> str:
     """
     Nicely format and indent a key-value pair
 
@@ -1034,7 +1538,11 @@ def format(
     return output
 
 
-def create_directory(path, name, dry=False, quiet=False):
+def create_directory(
+        path: str,
+        name: str,
+        dry: bool = False,
+        quiet: bool = False) -> None:
     """ Create a new directory, handle errors """
     say = log.debug if quiet else echo
     if os.path.isdir(path):
@@ -1052,7 +1560,13 @@ def create_directory(path, name, dry=False, quiet=False):
 
 
 def create_file(
-        path, content, name, dry=False, force=False, mode=0o664, quiet=False):
+        path: str,
+        content: str,
+        name: str,
+        dry: bool = False,
+        force: bool = False,
+        mode: int = 0o664,
+        quiet: bool = False) -> None:
     """ Create a new file, handle errors """
     say = log.debug if quiet else echo
     action = 'would be created' if dry else 'created'
@@ -1076,7 +1590,22 @@ def create_file(
             name, path, error))
 
 
-def public_git_url(url):
+# Avoid multiple subprocess calls for the same url
+@lru_cache(maxsize=None)
+def check_git_url(url: str) -> str:
+    """ Check that a remote git url is accessible """
+    try:
+        log.debug(f"Check git url '{url}'.")
+        subprocess.check_call(
+            ["git", "ls-remote", "--heads", url],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env={"GIT_ASKPASS": "echo", "GIT_TERMINAL_PROMPT": "0"})
+        return url
+    except subprocess.CalledProcessError:
+        raise GitUrlError(f"Unable to contact remote git via '{url}'.")
+
+
+def public_git_url(url: str) -> str:
     """
     Convert a git url into a public format
 
@@ -1085,8 +1614,8 @@ def public_git_url(url):
     """
 
     # GitHub, GitLab
-    # old: git@github.com:psss/tmt.git
-    # new: https://github.com/psss/tmt.git
+    # old: git@github.com:teemtee/tmt.git
+    # new: https://github.com/teemtee/tmt.git
     matched = re.match('git@(.*):(.*)', url)
     if matched:
         host, project = matched.groups()
@@ -1116,34 +1645,126 @@ def public_git_url(url):
     return url
 
 
-def retry_session(retries=3, backoff_factor=0.1, method_whitelist=False,
-                  status_forcelist=(429, 500, 502, 503, 504)):
+class TimeoutHTTPAdapter(requests.adapters.HTTPAdapter):
     """
-    Create a requests.Session() that retries on request failure.
-
-    'method_whitelist' is set to False to retry on all http request methods
-    by default.
+    Spice up request's session with custom timeout.
     """
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=status_forcelist,
-        method_whitelist=method_whitelist,
-        raise_on_status=False,
-        )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.timeout = kwargs.pop('timeout', None)
+
+        super().__init__(*args, **kwargs)
+
+    def send(  # type: ignore # does not match superclass type on purpose
+            self,
+            request: requests.PreparedRequest,
+            **kwargs: Any) -> requests.Response:
+        kwargs.setdefault('timeout', self.timeout)
+
+        return super().send(request, **kwargs)
 
 
-def remove_color(text):
+class RetryStrategy(requests.packages.urllib3.util.retry.Retry):  # type: ignore[misc]
+    def increment(
+            self,
+            *args: Any,
+            **kwargs: Any
+            ) -> requests.packages.urllib3.util.retry.Retry:
+        error = cast(Optional[Exception], kwargs.get('error', None))
+
+        # Detect a subset of exception we do not want to follow with a retry.
+        if error is not None:
+            # Failed certificate verification - this issue will probably not get any better
+            # should we try again.
+            if isinstance(error, urllib3.exceptions.SSLError) \
+                    and 'certificate verify failed' in str(error):
+
+                # [mpr] I'm not sure how stable this *iternal* API is, but pool seems to be the
+                # only place aware of the remote hostname. Try our best to get the hostname for
+                # a better error message, but don't crash because of a missing attribute or
+                # something as dumb.
+
+                connection_pool = kwargs.get('_pool', None)
+
+                if connection_pool is not None and hasattr(connection_pool, 'host'):
+                    message = f"Certificate verify failed for '{connection_pool.host}'."
+                else:
+                    message = 'Certificate verify failed.'
+
+                raise GeneralError(message, original=error) from error
+
+        return super().increment(*args, **kwargs)
+
+
+class retry_session(contextlib.AbstractContextManager):  # type: ignore
+    """
+    Context manager for requests.Session() with retries and timeout
+    """
+    @staticmethod
+    def create(
+            retries: int = DEFAULT_RETRY_SESSION_RETRIES,
+            backoff_factor: float = DEFAULT_RETRY_SESSION_BACKOFF_FACTOR,
+            allowed_methods: Optional[Tuple[str, ...]] = None,
+            status_forcelist: Optional[Tuple[int, ...]] = None,
+            timeout: Optional[int] = None
+            ) -> requests.Session:
+        retry_strategy = RetryStrategy(
+            total=retries,
+            status_forcelist=status_forcelist,
+            # `method_whitelist`` has been renamed to `allowed_methods` since
+            # urllib3 1.26, and it will be removed in urllib3 2.0.
+            # `allowed_methods` is therefore the future-proof name, but for the
+            # sake of backward compatibility, internally we need to use the
+            # deprecated parameter for now. Or request newer urllib3, but that
+            # might a problem because of RPM availability.
+            method_whitelist=allowed_methods,
+            backoff_factor=backoff_factor)
+
+        if timeout is not None:
+            http_adapter: requests.adapters.HTTPAdapter = TimeoutHTTPAdapter(
+                timeout=timeout, max_retries=retry_strategy)
+        else:
+            http_adapter = requests.adapters.HTTPAdapter(
+                max_retries=retry_strategy)
+
+        session = requests.Session()
+        session.mount('http://', http_adapter)
+        session.mount('https://', http_adapter)
+
+        return session
+
+    def __init__(
+            self,
+            retries: int = DEFAULT_RETRY_SESSION_RETRIES,
+            backoff_factor: float = DEFAULT_RETRY_SESSION_BACKOFF_FACTOR,
+            allowed_methods: Optional[Tuple[str, ...]] = None,
+            status_forcelist: Optional[Tuple[int, ...]] = None,
+            timeout: Optional[int] = None
+            ) -> None:
+        self.retries = retries
+        self.backoff_factor = backoff_factor
+        self.allowed_methods = allowed_methods
+        self.status_forcelist = status_forcelist
+        self.timeout = timeout
+
+    def __enter__(self) -> requests.Session:
+        return self.create(
+            retries=self.retries,
+            backoff_factor=self.backoff_factor,
+            allowed_methods=self.allowed_methods,
+            status_forcelist=self.status_forcelist,
+            timeout=self.timeout)
+
+    def __exit__(self, *args: Any) -> None:
+        pass
+
+
+def remove_color(text: str) -> str:
     """ Remove ansi color sequences from the string """
     return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
 
 
-def default_branch(repository, remote='origin'):
+def default_branch(repository: str, remote: str = 'origin') -> str:
     """ Detect default branch from given local git repository """
     head = os.path.join(repository, f'.git/refs/remotes/{remote}/HEAD')
     # Make sure the HEAD reference is available
@@ -1155,13 +1776,13 @@ def default_branch(repository, remote='origin'):
         return ref.read().strip().split('/')[-1]
 
 
-def parse_dotenv(content: str) -> Dict[str, str]:
+def parse_dotenv(content: str) -> EnvironmentType:
     """ Parse dotenv (shell) format of variables """
     return dict([line.split("=", maxsplit=1)
                 for line in shlex.split(content, comments=True)])
 
 
-def parse_yaml(content: str) -> Dict[str, str]:
+def parse_yaml(content: str) -> EnvironmentType:
     """ Parse variables from yaml, ensure flat dictionary format """
     yaml_as_dict = YAML(typ="safe").load(content)
     # Handle empty file as an empty environment
@@ -1174,35 +1795,85 @@ def parse_yaml(content: str) -> Dict[str, str]:
     return {key: str(value) for key, value in yaml_as_dict.items()}
 
 
-def validate_fmf_id(fmf_id):
+def validate_git_status(test: 'tmt.base.Test') -> Tuple[bool, str]:
     """
-    Validate given fmf id and return a human readable error
+    Validate that test has current metadata on fmf_id
 
     Return a tuple (boolean, message) as the result of validation.
-    The boolean specifies the validation result and the message
-    the validation error. In case the FMF id is valid, return an empty
-    string as the message.
+
+    Checks that sources:
+    - all local changes are committed
+    - up to date on remote repository
+    - .fmf/version marking fmf root is committed as well
+
+    When all checks pass returns (True, '').
     """
-    # Validate remote id and translate to human readable errors
+    sources = test.node.sources + \
+        [os.path.join(test.node.root, '.fmf', 'version')]
+
+    # Use tmt's run instead of subprocess.run
+    run = Common().run
+
+    # Check for not committed metadata changes
+    cmd = ['git', 'status', '--porcelain', '--'] + sources
     try:
-        fmf.base.Tree.node(fmf_id)
-    except fmf.utils.GeneralError as error:
-        # Map fmf errors to more user friendly alternatives
-        error_map = [
-            ('git clone', f"repo '{fmf_id.get('url')}' cannot be cloned"),
-            ('git checkout', f"git ref '{fmf_id.get('ref')}' is invalid"),
-            ('directory path', f"path '{fmf_id.get('path')}' is invalid"),
-            ('tree root',
-             f"No tree found in repo '{fmf_id.get('url')}', "
-             f"missing an '.fmf' directory?")
-            ]
-        errors = [err[1] for err in error_map if err[0] in str(error)]
-        return (False, errors[0] if errors else str(error))
+        result = run(cmd, cwd=test.node.root, join=True)
+    except RunError as error:
+        return (
+            False,
+            f"Failed to run git status: {error.stdout}"
+            )
+
+    not_committed = []
+    assert result.stdout is not None
+    for line in result.stdout.split('\n'):
+        if line:
+            # XY PATH or XY ORIG -> PATH. XY and PATH are separated by space
+            not_committed.append(line[3:])
+
+    if not_committed:
+        return (False, "Uncommitted changes in " + " ".join(not_committed))
+
+    # Check for not pushed changes
+    cmd = ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]
+    try:
+        result = run(cmd, cwd=test.node.root)
+    except RunError as error:
+        return (
+            False,
+            f'Failed to get remote branch, error raised: "{error.stderr}"'
+            )
+
+    assert result.stdout is not None
+    remote_ref = result.stdout.strip()
+
+    cmd = [
+        'git',
+        'diff',
+        f'HEAD..{remote_ref}',
+        '--name-status',
+        '--'] + sources
+    try:
+        result = run(cmd, cwd=test.node.root)
+    except RunError as error:
+        return (
+            False,
+            f'Failed to diff against remote branch, error raised: "{error.stderr}"')
+
+    not_pushed = []
+    assert result.stdout is not None
+    for line in result.stdout.split('\n'):
+        if line:
+            _, path = line.strip().split('\t', maxsplit=2)
+            not_pushed.append(path)
+    if not_pushed:
+        return (False, "Not pushed changes in " + " ".join(not_pushed))
 
     return (True, '')
 
 
-def generate_runs(path, id_):
+def generate_runs(
+        path: str, id_: Optional[str] = None) -> Generator[str, None, None]:
     """ Generate absolute paths to runs from path """
     # Prepare absolute workdir path if --id was used
     if id_:
@@ -1228,7 +1899,7 @@ def generate_runs(path, id_):
         yield abs_path
 
 
-def load_run(run):
+def load_run(run: 'tmt.base.Run') -> Tuple[bool, Optional[Exception]]:
     """ Load a run and its steps from the workdir """
     try:
         run.load_from_workdir()
@@ -1243,6 +1914,9 @@ def load_run(run):
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #  StructuredField
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SFSectionValueType = Union[str, List[str]]
+
 
 class StructuredField(object):
     """
@@ -1385,23 +2059,29 @@ class StructuredField(object):
     #  StructuredField Special
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def __init__(self, text=None, version=1, multi=False):
+    def __init__(
+            self,
+            text: Optional[str] = None,
+            version: int = 1,
+            multi: bool = False) -> None:
         """ Initialize the structured field """
         self.version(version)
-        self._header = ""
-        self._footer = ""
-        self._sections = {}
-        self._order = []
+        self._header: str = ""
+        self._footer: str = ""
+        # Sections are internally stored in their serialized form, i.e. as
+        # strings.
+        self._sections: Dict[str, str] = {}
+        self._order: List[str] = []
         self._multi = multi
         if text is not None:
             self.load(text)
 
-    def __iter__(self):
-        """ By default iterate through all available sections """
+    def __iter__(self) -> Generator[str, None, None]:
+        """ By default iterate through all available section names """
         for section in self._order:
             yield section
 
-    def __nonzero__(self):
+    def __nonzero__(self) -> bool:
         """ True when any section is defined """
         return len(self._order) > 0
 
@@ -1411,7 +2091,7 @@ class StructuredField(object):
     #  StructuredField Private
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def _load_version_zero(self, text):
+    def _load_version_zero(self, text: str) -> None:
         """ Load version 0 format """
         # Attempt to split the text according to the section tag
         section = re.compile(r"\n?^\[([^\]]+)\]\n", re.MULTILINE)
@@ -1431,7 +2111,7 @@ class StructuredField(object):
         for key, value in zip(keys, values):
             self.set(key, value)
 
-    def _load(self, text):
+    def _load(self, text: str) -> None:
         """ Load version 1+ format """
         # The text must exactly match the format
         format = re.compile(
@@ -1457,15 +2137,15 @@ class StructuredField(object):
         section = re.compile(r"\n\[([^\]]+)\][ \t]*\n", re.MULTILINE)
         parts = section.split(matched.groups()[1])
         # Detect the version
-        try:
-            self.version(int(re.search(
-                r"version (\d+)", parts[0]).groups()[0]))
-            log.debug(
-                "Detected StructuredField version {0}".format(self.version()))
-        except AttributeError:
+        version_match = re.search(r"version (\d+)", parts[0])
+        if not version_match:
             log.error(parts[0])
             raise StructuredFieldError(
                 "Unable to detect StructuredField version")
+        self.version(int(version_match.groups()[0]))
+        log.debug(
+            "Detected StructuredField version {0}".format(
+                self.version()))
         # Convert to dictionary, remove escapes and save the order
         keys = parts[1::2]
         escape = re.compile(r"^\[structured-field-escape\]", re.MULTILINE)
@@ -1475,7 +2155,7 @@ class StructuredField(object):
         log.debug(u"Parsed sections:\n{0}".format(
             pprint.pformat(self._sections)))
 
-    def _save_version_zero(self):
+    def _save_version_zero(self) -> str:
         """ Save version 0 format """
         result = []
         if self._header:
@@ -1488,7 +2168,7 @@ class StructuredField(object):
             result.append(self._footer)
         return "\n".join(result)
 
-    def _save(self):
+    def _save(self) -> str:
         """ Save version 1+ format """
         result = []
         # Regular expression for escaping section-like lines
@@ -1511,9 +2191,9 @@ class StructuredField(object):
             result.append(self._footer)
         return "\n".join(result)
 
-    def _read_section(self, content):
+    def _read_section(self, content: str) -> Dict[str, SFSectionValueType]:
         """ Parse config section and return ordered dictionary """
-        dictionary = OrderedDict()
+        dictionary: Dict[str, SFSectionValueType] = OrderedDict()
         for line in content.split("\n"):
             # Remove comments and skip empty lines
             line = re.sub("#.*", "", line)
@@ -1528,15 +2208,16 @@ class StructuredField(object):
             value = matched.groups()[1].strip()
             # Handle multiple values if enabled
             if key in dictionary and self._multi:
-                if isinstance(dictionary[key], list):
-                    dictionary[key].append(value)
+                stored_value = dictionary[key]
+                if isinstance(stored_value, list):
+                    stored_value.append(value)
                 else:
-                    dictionary[key] = [dictionary[key], value]
+                    dictionary[key] = [stored_value, value]
             else:
                 dictionary[key] = value
         return dictionary
 
-    def _write_section(self, dictionary):
+    def _write_section(self, dictionary: Dict[str, SFSectionValueType]) -> str:
         """ Convert dictionary into a config section format """
         section = ""
         for key in dictionary:
@@ -1551,12 +2232,12 @@ class StructuredField(object):
     #  StructuredField Methods
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def iterate(self):
+    def iterate(self) -> Generator[Tuple[str, str], None, None]:
         """ Return (section, content) tuples for all sections """
         for section in self:
             yield section, self._sections[section]
 
-    def version(self, version=None):
+    def version(self, version: Optional[int] = None) -> int:
         """ Get or set the StructuredField version """
         if version is not None:
             if version in [0, 1]:
@@ -1566,21 +2247,16 @@ class StructuredField(object):
                     "Bad StructuredField version: {0}".format(version))
         return self._version
 
-    def load(self, text, version=None):
+    def load(self, text: str, version: Optional[int] = None) -> None:
         """ Load the StructuredField from a string """
         if version is not None:
             self.version(version)
-        # Make sure we got a text, convert to unicode if necessary
-        try:
-            if not isinstance(text, basestring):
-                raise StructuredFieldError(
-                    "Invalid StructuredField, expecting string or unicode")
-            if not isinstance(text, unicode):
-                text = text.decode("utf8")
-        except NameError:
-            if not isinstance(text, str):
-                raise StructuredFieldError(
-                    "Invalid StructuredField, expecting string")
+        # Make sure we got a text, convert from bytes if necessary
+        if isinstance(text, bytes):
+            text = text.decode("utf8")
+        if not isinstance(text, str):
+            raise StructuredFieldError(
+                "Invalid StructuredField, expecting string")
         # Remove possible carriage returns
         text = re.sub("\r\n", "\n", text)
         # Make sure the text has a new line at the end
@@ -1593,36 +2269,39 @@ class StructuredField(object):
         else:
             self._load(text)
 
-    def save(self):
+    def save(self) -> str:
         """ Convert the StructuredField into a string """
         if self.version() == 0:
             return self._save_version_zero()
         else:
             return self._save()
 
-    def header(self, content=None):
+    def header(self, content: Optional[str] = None) -> str:
         """ Get or set the header content """
         if content is not None:
             self._header = content
         return self._header
 
-    def footer(self, content=None):
+    def footer(self, content: Optional[str] = None) -> str:
         """ Get or set the footer content """
         if content is not None:
             self._footer = content
         return self._footer
 
-    def sections(self):
+    def sections(self) -> List[str]:
         """ Get the list of available sections """
         return self._order
 
-    def get(self, section, item=None):
+    def get(
+            self,
+            section: str,
+            item: Optional[str] = None) -> SFSectionValueType:
         """ Return content of given section or section item """
         try:
             content = self._sections[section]
         except KeyError:
             raise StructuredFieldError(
-                "Section [{0}] not found".format(ascii(section)))
+                "Section [{0!r}] not found".format(ascii(section)))
         # Return the whole section content
         if item is None:
             return content
@@ -1631,21 +2310,19 @@ class StructuredField(object):
             return self._read_section(content)[item]
         except KeyError:
             raise StructuredFieldError(
-                "Unable to read '{0}' from section '{1}'".format(
+                "Unable to read '{0!r}' from section '{1!r}'".format(
                     ascii(item), ascii(section)))
 
-    def set(self, section, content, item=None):
+    def set(self, section: str, content: Any,
+            item: Optional[str] = None) -> None:
         """ Update content of given section or section item """
         # Convert to string if necessary, keep lists untouched
-        if not isinstance(content, list):
-            try:
-                if not isinstance(content, basestring):
-                    content = unicode(content)
-                elif not isinstance(content, unicode):
-                    content = content.decode("utf8")
-            except BaseException:
-                if not isinstance(content, str):
-                    content = str(content)
+        if isinstance(content, list):
+            pass
+        elif isinstance(content, bytes):
+            content = content.decode("utf8")
+        elif not isinstance(content, str):
+            content = str(content)
         # Set the whole section content
         if item is None:
             # Add new line if missing
@@ -1665,7 +2342,7 @@ class StructuredField(object):
         if section not in self._order:
             self._order.append(section)
 
-    def remove(self, section, item=None):
+    def remove(self, section: str, item: Optional[str] = None) -> None:
         """ Remove given section or section item """
         # Remove the whole section
         if item is None:
@@ -1674,7 +2351,7 @@ class StructuredField(object):
                 del self._order[self._order.index(section)]
             except KeyError:
                 raise StructuredFieldError(
-                    "Section [{0}] not found".format(ascii(section)))
+                    "Section [{0!r}] not found".format(ascii(section)))
         # Remove only selected item from the section
         else:
             try:
@@ -1682,7 +2359,7 @@ class StructuredField(object):
                 del(dictionary[item])
             except KeyError:
                 raise StructuredFieldError(
-                    "Unable to remove '{0}' from section '{1}'".format(
+                    "Unable to remove '{0!r}' from section '{1!r}'".format(
                         ascii(item), ascii(section)))
             self._sections[section] = self._write_section(dictionary)
 
@@ -1691,10 +2368,14 @@ class DistGitHandler(object):
     """ Common functionality for DistGit handlers """
     sources_file_name = 'sources'
     uri = "/rpms/{name}/{filename}/{hashtype}/{hash}/{filename}"
-    remote_substring = None
-    usage_name = "Name to use for dist-git-type"
 
-    def url_and_name(self, cwd='.'):
+    usage_name: str  # Name to use for dist-git-type
+    re_source: Pattern[str]
+    re_ignore_extensions: Pattern[str] = re.compile(r'\.(sign|asc|key)$')
+    lookaside_server: str
+    remote_substring: Pattern[str]
+
+    def url_and_name(self, cwd: str = '.') -> List[Tuple[str, str]]:
         """
         Return list of urls and basenames of the used source
 
@@ -1710,6 +2391,10 @@ class DistGitHandler(object):
             with open(os.path.join(cwd, self.sources_file_name)) as f:
                 for line in f.readlines():
                     match = self.re_source.match(line)
+                    if match is None:
+                        raise GeneralError(
+                            f"Couldn't match '{self.sources_file_name}' "
+                            f"content with '{self.re_source.pattern}'.")
                     used_hash, source_name, hash_value = match.groups()
                     ret_values.append((self.lookaside_server + self.uri.format(
                         name=package,
@@ -1726,7 +2411,7 @@ class DistGitHandler(object):
                 "No sources found in '{self.sources_file_name}' file.")
         return ret_values
 
-    def its_me(self, remotes):
+    def its_me(self, remotes: List[str]) -> bool:
         """ True if self can work with remotes """
         return any([self.remote_substring.search(item) for item in remotes])
 
@@ -1747,7 +2432,9 @@ class CentOSDistGit(DistGitHandler):
     remote_substring = re.compile(r'redhat/centos')
 
 
-def get_distgit_handler(remotes=None, usage_name=None):
+def get_distgit_handler(
+        remotes: Optional[List[str]] = None,
+        usage_name: Optional[str] = None) -> DistGitHandler:
     """
     Return the right DistGitHandler
 
@@ -1764,6 +2451,129 @@ def get_distgit_handler(remotes=None, usage_name=None):
     raise GeneralError(f"No known remote in '{remotes}'.")
 
 
-def get_distgit_handler_names():
+def get_distgit_handler_names() -> List[str]:
     """ All known distgit handlers """
     return [i.usage_name for i in DistGitHandler.__subclasses__()]
+
+
+def git_clone(
+        url: str,
+        destination: str,
+        common: Common,
+        env: Optional[EnvironmentType] = None,
+        shallow: bool = False
+        ) -> CommandOutput:
+    """
+    Git clone url to destination, retry without shallow if necessary
+
+    For shallow=True attempt to clone repository using --depth=1 option first.
+    If not successful attempt to clone whole repo.
+
+    Common instance is used to run the command for appropriate logging.
+    Environment is updated by 'env' dictionary.
+    """
+    depth = ['--depth=1'] if shallow else []
+    command = ['git', 'clone'] + depth + [url, destination]
+    try:
+        return common.run(command, env=env)
+    except RunError:
+        if not shallow:
+            # Do not retry if shallow was not used
+            raise
+        # Git server might not support shallow cloning, try again
+        return git_clone(url, destination, common, env, shallow=False)
+
+
+class updatable_message(contextlib.AbstractContextManager):  # type: ignore
+    """ Updatable message suitable for progress-bar-like reporting """
+
+    def __init__(
+            self,
+            key: str,
+            enabled: bool = True,
+            indent_level: int = 0,
+            key_color: Optional[str] = None,
+            default_value_color: Optional[str] = None
+            ) -> None:
+        """
+        Updatable message suitable for progress-bar-like reporting.
+
+        .. code:block:: python3
+
+           with updatable_message('foo') as message:
+               while ...:
+                   ...
+
+                   # check state of remote request, and update message
+                   state = remote_api.check()
+                   message.update(state)
+
+        :param key: a string to use as the left-hand part of logged message.
+        :param enabled: if unset, no output would be performed.
+        :param indent_level: desired indentation level.
+        :param key_color: optional color to apply to ``key``.
+        :param default_color: optional color to apply to value when
+            :py:meth:`update` is called with ``color`` left out.
+        """
+
+        self.key = key
+        self.enabled = enabled
+        self.indent_level = indent_level
+        self.key_color = key_color
+        self.default_value_color = default_value_color
+
+        # No progress if terminal not attached
+        if not sys.stdout.isatty():
+            self.enabled = False
+
+        self._previous_line: Optional[str] = None
+
+    def __enter__(self) -> 'updatable_message':
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
+    def update(self, value: str, color: Optional[str] = None) -> None:
+        if not self.enabled:
+            return
+
+        if self._previous_line is not None:
+            message = value.ljust(len(self._previous_line))
+
+        else:
+            message = value
+
+        self._previous_line = value
+
+        message = indent(
+            self.key,
+            value=style(
+                message,
+                fg=color or self.default_value_color),
+            color=self.key_color,
+            level=self.indent_level)
+
+        sys.stdout.write(f"\r{message}")
+        sys.stdout.flush()
+
+
+def find_fmf_root(path: str) -> List[str]:
+    """
+    Search trough path and return all fmf roots that exist there
+
+    Returned list is ordered by path length, shortest one first.
+
+    Raise `MetadataError` if no fmf root is found.
+    """
+    fmf_roots = []
+    for root, _, files in os.walk(path):
+        if not os.path.basename(root) == '.fmf':
+            continue
+        if 'version' in files:
+            fmf_roots.append(os.path.dirname(root))
+    if not fmf_roots:
+        raise MetadataError(f"No fmf root present inside '{path}'.")
+    fmf_roots.sort(key=lambda path: len(path))
+    return fmf_roots

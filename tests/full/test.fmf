@@ -1,0 +1,29 @@
+summary: Run the full tmt test suite in an external system
+description: |
+    Run under a local virtual machine:
+    tmt run
+
+    Schedule a job using workflow-tomorrow:
+    tmt test export --fmf-id | wow fedora-35 x86_64 --fmf-id -
+
+test: ./test.sh
+framework: beakerlib
+adjust:
+- when: distro != fedora
+  require+:
+  - library(epel/epel)
+require:
+- rsync
+- git-core
+- rpm-build
+- make
+- procps-ng
+- /usr/bin/virsh
+recommend:
+- guestfs-tools
+- python3-docutils
+duration: 4h
+extra-hardware: |
+  keyvalue=HVM=1
+  hostrequire=memory >= 6144
+  hostrequire=hypervisor=

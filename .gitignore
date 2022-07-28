@@ -33,6 +33,7 @@ share/python-wheels/
 MANIFEST
 
 # Testing
+.mypy_cache
 .pytest_cache
 
 # Virtual environment
@@ -69,3 +70,6 @@ tags
 
 # Persistent undo
 [._]*.un~
+
+# Visual Studio Code
+.vscode

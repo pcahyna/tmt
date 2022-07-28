@@ -49,19 +49,21 @@ def test_test_invalid():
     """ Test invalid test """
     # Missing name
     with pytest.raises(tmt.utils.GeneralError):
-        test = tmt.Test({})
+        tmt.Test({})
     # Invalid name
     with pytest.raises(SpecificationError):
-        test = tmt.Test({}, name='bad')
+        tmt.Test({}, name='bad')
     # Invalid attributes
     for key in ['component', 'require', 'tag']:
         with pytest.raises(SpecificationError):
-            test = tmt.Test({key: 1}, name='/smoke')
+            tmt.Test({key: 1}, name='/smoke')
     with pytest.raises(SpecificationError):
-        test = tmt.Test({'environment': 'string'}, name='/smoke')
+        tmt.Test({'environment': 'string'}, name='/smoke')
     # Listify attributes
-    assert tmt.Test({'tag': 'a'}, name='/smoke').tag == ['a']
-    assert tmt.Test({'tag': ['a', 'b']}, name='/smoke').tag == ['a', 'b']
+    assert tmt.Test(
+        {'test': 'test', 'tag': 'a'}, name='/smoke').tag == ['a']
+    assert tmt.Test(
+        {'test': 'test', 'tag': ['a', 'b']}, name='/smoke').tag == ['a', 'b']
 
 
 def test_link():
@@ -96,7 +98,7 @@ def test_link():
     # Full fmf id
     fmf_id = tmt.utils.yaml_to_dict("""
         blocked-by:
-            url: https://github.com/psss/fmf
+            url: https://github.com/teemtee/fmf
             name: /stories/select/filter/regexp
         note: Need to get the regexp filter working first.
         """)

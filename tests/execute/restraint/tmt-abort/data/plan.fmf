@@ -1,0 +1,9 @@
+discover:
+    how: fmf
+    test:
+     - abort
+     - do-not-run
+provision:
+    how: container
+execute:
+    how: tmt
